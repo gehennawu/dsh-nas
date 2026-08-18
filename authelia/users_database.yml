@@ -1,0 +1,14 @@
+############################################################
+# Authelia 用户库 — dsh-nas
+#
+# 密码必须是 argon2id 哈希（deploy.sh 配置向导会自动生成）：
+#   docker run --rm authelia/authelia:4.39 authelia crypto hash generate argon2 --password '你的密码'
+# 把输出的 $argon2id$... 整行粘贴到下面的 password 字段。
+############################################################
+users:
+  admin:
+    displayname: 'Admin'
+    password: '$argon2id$v=19$m=65536,t=1,p=8$...'   # ← 占位符，向导或手动生成后替换
+    email: admin@example.com
+    groups:
+      - admins

@@ -1,0 +1,81 @@
+############################################################
+# Authelia 配置（固定 v4.39，官方文档确认）— dsh-nas
+#
+# 本文件为占位模板：直接运行 ./deploy.sh，配置向导会自动完成
+# 域名替换、密钥生成与公网端口（原文件备份为 .bak）；也可手动修改。
+#
+# 注：v4.39 已移除 trusted_proxies 配置项（server.headers 下无此键）。
+# Authelia 自动处理来自反向代理的信任头，无需手动配置。
+############################################################
+
+# Authelia 只被本机 Caddy 调用，监听回环地址最安全
+server:
+  address: 'tcp://127.0.0.1:9091'
+
+log:
+  level: info
+
+theme: dark
+
+# v4.38+ 必填（4.39 同）：重置密码流程的 JWT 签名密钥
+identity_validation:
+  reset_password:
+    jwt_secret: 'CHANGE_ME_reset_password_jwt_secret'
+
+totp:
+  issuer: dsh-nas
+  period: 30
+  skew: 1
+
+# 用户库（文件后端，适合家庭/小团队）
+authentication_backend:
+  file:
+    path: /config/users_database.yml
+    password:
+      algorithm: argon2id
+      iterations: 1
+      salt_length: 16
+      parallelism: 8
+      memory: 64
+
+# 访问控制：默认拒绝，只放行声明的域名
+access_control:
+  default_policy: deny
+  rules:
+    # 登录门户自身（由 Caddy 直接反代，不参与 forward_auth 评估；
+    # 此规则防御直连场景）
+    - domain: 'auth.example.com'
+      policy: bypass
+    # DSH 应用：强制双因素
+    - domain: 'dsh.example.com'
+      policy: two_factor
+
+# 会话：cookie 挂在父域上，auth 与 dsh 两个子域共享登录态。
+# 新版要求每 cookie 自带 default_redirection_url（不可与全局 default_redirection_url 共存）。
+session:
+  name: authelia_session
+  secret: 'CHANGE_ME_session_secret'
+  expiration: 1h
+  inactivity: 5m
+  cookies:
+    - domain: 'example.com'
+      authelia_url: 'https://auth.example.com'
+      default_redirection_url: 'https://dsh.example.com'
+
+# 登录失败限制（防爆破）
+regulation:
+  max_retries: 5
+  find_time: 2m
+  ban_time: 5m
+
+# 单实例用 SQLite，不需要 Redis。新版要求 storage.encryption_key（SQLite 加密）。
+storage:
+  encryption_key: 'CHANGE_ME_storage_encryption_key'
+  local:
+    path: /config/db.sqlite3
+
+# 文件通知器：TOTP 注册码、重置密码码会写入该文件，
+# 部署时从 NAS 宿主读取（见 README）
+notifier:
+  filesystem:
+    filename: /config/notifications.txt

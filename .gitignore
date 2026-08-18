@@ -1,0 +1,7 @@
+data/
+caddy/data/
+caddy/config/
+.env
+*.bak
+notifications.txt
+*.sqlite3

@@ -1,0 +1,25 @@
+{
+  "name": "@dsh-nas/restart-dsh",
+  "version": "0.2.3",
+  "description": "设置页「服务控制」：一键重启与升级 dsh web（保留 Caddy/Authelia 配置）",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-api-remotes"
+      ],
+      "platform": "web"
+    }
+  }
+}
