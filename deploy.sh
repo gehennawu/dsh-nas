@@ -791,8 +791,9 @@ http://dsh.$ROOT {
 }
 EOF
       ok "已生成 Caddyfile（反代入口模式，内部 http://127.0.0.1:$INTERNAL_PORT，域名 $ROOT）"
-      echo "  ${C_Y}  提示: 在 lucky/CF 中把 dsh.$ROOT 和 auth.$ROOT 都转发到 http://127.0.0.1:$INTERNAL_PORT，并设 X-Forwarded-Proto: https；"
-      echo "  Caddy 内部端口已只绑回环（default_bind 127.0.0.1），局域网无法绕过 lucky 直连；若 lucky/CF 运行在其它机器，需把 default_bind 改成 0.0.0.0 或 NAS 局域网 IP${C_0}"
+      echo "  ${C_Y}  提示: 在 lucky/CF 中把 dsh.$ROOT 和 auth.$ROOT 都转发到 http://127.0.0.1:$INTERNAL_PORT，并设 X-Forwarded-Proto: https。"
+      echo "  后端地址必须填 127.0.0.1，不能填 NAS 局域网 IP——Caddy 只监听回环，局域网无法绕过认证直连。"
+      echo "  前置反代必须与本机 Caddy 同网络命名空间（host 网络）或能访问 NAS 回环地址，否则转发不通${C_0}"
     else
       if [ "$ENTRY_MODE" = "$MODE_DIRECT_80_443" ]; then
         # Caddy 直连公网：80/443，保留 HTTP→HTTPS 跳转并允许 ACME HTTP-01。

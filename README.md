@@ -172,7 +172,7 @@ sudo ./deploy.sh --latest     # 查询 npm latest，更新版本号后重建
 以同机 lucky 为例：
 
 1. 配置公网 HTTPS listener 和证书；
-2. `dsh.<domain>` 和 `auth.<domain>` 都转发到 `http://127.0.0.1:13080`；
+2. `dsh.<domain>` 和 `auth.<domain>` 都转发到 `http://127.0.0.1:13080`；后端地址必须是 `127.0.0.1`，不能填 NAS 局域网 IP——Caddy 只监听回环，这是防止局域网绕过认证直连的边界。lucky 需以 host 网络运行才能访问宿主回环；
 3. dsh 规则开启 WebSocket；
 4. 两条规则都设置 `X-Forwarded-Proto: https`；
 5. 向导中的公网端口与 lucky 实际监听端口一致。
@@ -202,7 +202,7 @@ docker compose restart dsh
 | 配置向导拒绝继续 | 检查域名、密钥、用户哈希和 Caddyfile 模式标记；必要时 `./deploy.sh --setup`。 |
 | 80 被占用 | 443 空闲选 443-only；443 也被占用选前置反代模式。 |
 | 443-only 证书申请失败 | 检查 A/AAAA、IPv6 防火墙和 443 可达性；看 `docker compose logs caddy`。 |
-| 前置反代模式打不开 | 确认两个域名都转发到 `127.0.0.1:13080`，开启 WebSocket，设置 `X-Forwarded-Proto: https`。 |
+| 前置反代 502 /「后端访问被拒绝」 | lucky/CF 的后端地址必须填 `http://127.0.0.1:13080`，**不能填 NAS 局域网 IP**——Caddy 只监听回环（旧版绑 0.0.0.0，局域网 IP 曾经可用，从旧版升级后必须改）。dsh 和 auth 两条规则都要指到这个地址。 |
 | 部署报告 Caddy 非回环 listener | 检查 Caddyfile 的 `default_bind 127.0.0.1`。 |
 | 未登录 401 或跳转循环 | 检查 Authelia URL、cookie domain、`X-Forwarded-Proto` 和 `forward_auth` 块。 |
 | dsh 反复重启或 profiles 不可写 | `sudo chown -R 1000:1000 data/dsh data/workspace`，确认挂载在可写本地目录。 |
