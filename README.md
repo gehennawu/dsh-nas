@@ -60,35 +60,47 @@ dsh 是能执行任意命令的 AI Agent，凭据一旦被拿走就是整台 NAS
 
 ## 三种 Caddy 入口模式
 
+三个模式的内部链路完全相同：Caddy → Authelia（双因素）→ dsh，都只在宿主回环上互联。**唯一的区别是：谁来当公网入口、TLS 在哪里终结。**
+
+| | 1. 直连 80/443 | 2. 直连 443-only | 3. 前置反代/Tunnel |
+|---|---|---|---|
+| 公网入口 | NAS 上的 Caddy | NAS 上的 Caddy | lucky / CF Tunnel 等 |
+| 需要 NAS 有公网 IP | 是（IPv4 或 IPv6） | 是（IPv4 或 IPv6） | 否 |
+| 需要开放入站端口 | 80 + 443 | 仅 443 | 前置入口的端口（如 16666） |
+| 证书由谁管 | Caddy 自动（ACME） | Caddy 自动（TLS-ALPN-01） | 前置入口 |
+| 访问地址 | `https://dsh.<domain>` | `https://dsh.<domain>` | `https://dsh.<domain>[:端口]` |
+
 配置向导会写入 `# dsh-nas-entry-mode: ...` 标记，部署脚本据此恢复模式并执行对应的端口与 listener 校验。
 
 ### 1. 直连 80/443：`direct-80-443`
 
-适合 DNS 直接解析到 NAS，且 80、443 都空闲。
+流量路径：`浏览器 →（公网）→ NAS:80/443 → Caddy → Authelia/dsh`
 
-- Caddy 监听 80 和 443，HTTP 自动跳转 HTTPS，可用 ACME HTTP-01
-- 防火墙放行 80、443
+- Caddy 自己就是公网入口：域名 A/AAAA 记录指向 NAS 的公网地址（动态 IP 配 DDNS），路由器把 80、443 转发进 NAS
+- 80 用于 HTTP→HTTPS 自动跳转和 ACME HTTP-01 证书验证
+- 国内家宽 80 端口大多被运营商封禁，此模式在国内家庭网络经常实际退化为模式 2
 - 部署后 Caddy 必须只报告 `:80`、`:443`
 
 ### 2. 直连 443-only：`direct-443-only`
 
-适合 80 被占用但 443 空闲。
+流量路径：`浏览器 →（公网）→ NAS:443 → Caddy → Authelia/dsh`
 
-- Caddy 只监听 443；`auto_https disable_redirects`，无 HTTP→HTTPS 跳转，访问必须显式 `https://`
-- 证书依赖 TLS-ALPN-01；若只能 DNS-01，需自行配置 Caddy DNS provider
+- 同样需要公网 IP（IPv4 或 IPv6 都行——没有公网 v4 时用 AAAA 记录走 IPv6 也算直连），但只要求 443 可达，80 被占用或被封也能用
+- Caddy 只监听 443；不提供 HTTP→HTTPS 跳转，浏览器必须显式输入 `https://`
+- 证书走 TLS-ALPN-01（只需 443 可达）；只能 DNS-01 的环境需自行配置 Caddy DNS provider
 - 部署后 Caddy 必须只报告 `:443`
 
-### 3. 同机前置反代/Tunnel：`front-proxy`
+### 3. 前置反代/Tunnel：`front-proxy`
 
-适合 NAS 上已有 lucky、OpenResty、Cloudflare Tunnel 等公网 TLS 入口。
+流量路径：`浏览器 →（公网）→ lucky/CF 等前置入口（在这里终结 TLS）→ NAS 内部 127.0.0.1:13080 → Caddy → Authelia/dsh`
 
-- 前置入口负责公网证书；Caddy `auto_https off`，只监听 `127.0.0.1:13080`
-- 前置入口必须把 `dsh.<domain>` 和 `auth.<domain>` 都转发到 Caddy，并设置 `X-Forwarded-Proto: https`
-- 前置入口必须与 Caddy 同机或能访问 NAS 回环地址（bridge 容器里的 `127.0.0.1` 不是宿主机）
-- 非回环 listener（如 `0.0.0.0:13080`）会硬失败
-- 公网端口写入 Authelia URL 和访问提示，如 `https://dsh.example.com:16666`
+- Caddy 不接触公网：`auto_https off`，只监听 `127.0.0.1:13080`；公网入口是 lucky、OpenResty、Cloudflare Tunnel 等
+- **NAS 不需要公网 IP，也不需要开放入站端口**（CF Tunnel 是纯出站连接；lucky 按自己的穿透/DDNS 方式工作）
+- 前置入口把 `dsh.<domain>` 和 `auth.<domain>` 都转发到 `http://127.0.0.1:13080`——后端地址必须是 127.0.0.1，不能填 NAS 局域网 IP；并设置 `X-Forwarded-Proto: https`
+- 前置入口必须与 Caddy 同机且能访问宿主回环（host 网络；bridge 容器里的 `127.0.0.1` 不是宿主机）；非回环 listener 会硬失败
+- 前置监听的非标端口（如 16666）会写进 Authelia URL 和访问地址
 
-如果 80 和 443 都被占用，只能选此模式。
+选择顺序：有公网 IP 且 80/443 都空闲 → 模式 1；有公网 IP 但 80 不可用 → 模式 2；没有公网 IP，或 NAS 上已经有 lucky/CF 入口 → 模式 3。
 
 ## 前置条件
 
