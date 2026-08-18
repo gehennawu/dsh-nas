@@ -10,7 +10,7 @@
 #    deploy.sh 启动后会验证实际绑定地址。
 # 3) 可选：DSH_TRUSTED_HOSTS 追加 --trusted-host（默认方案由 Caddy 改写
 #    Host 头绕过信任栅栏，不需要；仅在直连 3080 或透传真实 Host 时才需要）。
-# 4) 固化插件：确保「服务控制」（重启 + 升级 dsh）已装进 web profile。
+# 4) 固化插件：确保「服务控制」（仅安全重启 dsh web）已装进 web profile。
 #    首次启动时自动初始化 profile 并安装；镜像内插件版本变化时重新安装，
 #    让升级后的插件代码覆盖持久化 profile 中的旧版本。
 #    file: 本地包无需网络；失败不阻塞启动（日志可见，报错细节落

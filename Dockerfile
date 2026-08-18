@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 #
-# DeepSeek Harness (dsh) — 通用 NAS Docker 镜像（不限品牌）
+# DeepSeek Harness (dsh) — Linux NAS Docker 镜像模板
 #
 # 约束与设计：
 # 1. 基础镜像必须用完整版 node:22-bookworm（不能用 slim）——
@@ -32,34 +32,15 @@ RUN apt-get update \
 # ---------- 运行阶段：干净的运行时镜像 ----------
 FROM node:22-bookworm
 
-# node:22-bookworm 为完整版镜像，curl 用于下载 Docker CLI/Compose 静态二进制。
+# node:22-bookworm 为完整版镜像；当前网页升级不直接驱动宿主 Docker，
+# 因此运行镜像不再内置 Docker CLI/Compose，也不挂载 docker.sock。
 
 ARG PNPM_VERSION=11.20.0
-ARG DOCKER_CLI_VERSION=27.5.1
-ARG DOCKER_COMPOSE_VERSION=v2.35.1
 
 # tini（PID 1 init）+ git（git 源插件）+ CA 证书（同样走构建代理）
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl git tini \
+ && apt-get install -y --no-install-recommends ca-certificates git tini \
  && rm -rf /var/lib/apt/lists/*
-
-# 网页端「升级 dsh」使用：只安装 Docker CLI 与 Compose 插件，不运行 dockerd。
-# 插件通过 /var/run/docker.sock 驱动宿主 Docker；升级容器复用本镜像执行 deploy.sh。
-# static Docker CLI / Compose binary 按构建机架构下载，HTTP_PROXY/HTTPS_PROXY 由 deploy.sh 注入。
-RUN set -eux; \
-    case "$(uname -m)" in \
-      x86_64) docker_arch=x86_64 ;; \
-      aarch64) docker_arch=aarch64 ;; \
-      *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;; \
-    esac; \
-    curl -fsSL "https://download.docker.com/linux/static/stable/${docker_arch}/docker-${DOCKER_CLI_VERSION}.tgz" \
-      | tar -xz -C /usr/local/bin --strip-components=1 docker/docker; \
-    mkdir -p /usr/local/lib/docker/cli-plugins; \
-    curl -fsSL -o /usr/local/lib/docker/cli-plugins/docker-compose \
-      "https://github.com/docker/compose/releases/download/${DOCKER_COMPOSE_VERSION}/docker-compose-linux-${docker_arch}"; \
-    chmod +x /usr/local/lib/docker/cli-plugins/docker-compose; \
-    docker --version; \
-    docker compose version
 
 COPY --from=build /usr/local/lib/node_modules /usr/local/lib/node_modules
 # pnpm 固定版本：`dsh plugin` 运行时管理社区插件依赖它（转发 pnpm 命令），
@@ -81,7 +62,7 @@ RUN mkdir -p /workspace /home/node/.dsh \
  && usermod -d /workspace node
 WORKDIR /workspace
 
-# 固化插件：重启 dsh web 的「服务控制」（entrypoint 启动时自动安装到 web profile）
+# 固化插件：安全重启 dsh web（entrypoint 启动时自动安装到 web profile）
 COPY plugins/restart-dsh /opt/dsh-plugins/restart-dsh
 
 # 容器入口脚本（代理环境变量、固化插件安装、显式绑定回环启动 dsh web）

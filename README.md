@@ -1,83 +1,118 @@
-# dsh 通用 NAS 部署（Docker + Caddy 反代 + Authelia 双因素鉴权）
+# dsh-nas：特定 Linux NAS 部署模板
 
-任何支持 Docker 和 SSH 的机器都能用（NAS、迷你主机、普通 Linux 服务器均可）。
-（系统 UI 不提供 compose 编排入口时，SSH 下用 Docker Compose V2 插件即可；确实无法使用 compose 的环境，见文末「UI 手动创建」对照表。）
+这是一个面向 **Linux NAS** 的 dsh 部署模板：使用 Docker Engine、Docker Compose V2、Bash/GNU 工具和 host 网络，在 NAS 本地可写目录中运行 dsh、Authelia 与 Caddy。
 
-## 架构
+它不是通用 NAS 方案，也不承诺适用于所有 NAS 品牌或容器平台。当前支持边界见[支持范围](#支持范围)。
 
+## 支持范围
+
+### 当前支持
+
+- Linux 主机；
+- rootful Docker Engine；
+- Docker Compose V2（`docker compose` 插件或 V2 独立版）；
+- Bash、GNU `sed`/`grep`/`awk`/`stat` 等常用工具；
+- x86_64 和 ARM64（基础镜像及依赖能够在目标架构构建）；
+- `network_mode: host`；
+- 项目目录、`data/`、`authelia/data/` 和 `caddy/` 位于本地可写文件系统；
+- 容器内 dsh 使用 UID 1000 运行，宿主目录必须允许 UID 1000 写入。
+
+### 不在当前支持范围
+
+- TrueNAS CORE、非 Linux Docker 主机；
+- rootless Docker；
+- 不支持 host 网络的容器平台；
+- 仅提供 BusyBox、缺少 Bash/GNU 工具的环境；
+- 不能使用 Docker Compose V2 的 NAS 管理界面；
+- 把 Docker socket 暴露给 dsh 的网页升级方案；
+- 没有域名且没有可用前置 TLS 代理的部署。
+
+## 架构与安全边界
+
+```text
+公网浏览器
+    │
+    ├─ 直连 80/443 或 443-only ──> Caddy ──> Authelia 127.0.0.1:9091
+    │                                      └─> dsh 127.0.0.1:3080
+    │
+    └─ 同机前置反代/Tunnel ──> Caddy 127.0.0.1:13080
+                                         ├─> Authelia 127.0.0.1:9091
+                                         └─> dsh 127.0.0.1:3080
+
+ dsh 出站请求 ──> NAS 宿主代理（默认 127.0.0.1:7890）
 ```
-浏览器 ── https://dsh.example.com ──> Caddy (host 网络)
-              ├── forward_auth ──> Authelia 127.0.0.1:9091   ← 未登录 → 302 跳登录页（2FA）
-              └── reverse_proxy ──> dsh 127.0.0.1:3080
-   dsh 出站（LLM API / 联网搜索）──> 宿主代理 127.0.0.1:7890
-```
 
-- 三个容器都用 **host 网络**：容器里的 `127.0.0.1` 就是 NAS 宿主本身——dsh 直通宿主代理、Caddy 直连 dsh、Authelia 只监听回环；
-- **Caddy 自动 HTTPS**：有域名时自动申请/续期 Let's Encrypt 证书，WebSocket/SSE 无需任何额外配置；
-- **Authelia 双因素**：未登录访问 DSH → 自动跳转登录页 → 用户名密码 + TOTP 验证码；
-- dsh 由 entrypoint.sh 显式 `--host 127.0.0.1` 绑定回环（host 网络下的安全前提），`deploy.sh` 启动后自动验证实际绑定地址，一旦发现监听非回环立即报错；对外暴露完全交给 Caddy + 鉴权；
-- **容器设计**：非 root（官方 `node` 用户，UID 1000）+ **tini**（PID 1：信号转发与子进程收割）；`pnpm@11.20.0` 固定版本供 `dsh plugin` 运行时管理插件；数据与工作区分离——`/home/node/.dsh`（配置/凭据/会话/存储）与 `/workspace`（交互主目录，Web 目录选择器新建落点）；
-- **固化插件「服务控制」**：设置面板提供一键「重启 dsh web」与「升级 dsh」（获取 npm 最新版或手动输入版本号 → 后台改版本号并执行 `deploy.sh`，保留 Caddy/Authelia 配置与数据）。插件随镜像固化（`plugins/restart-dsh`），entrypoint 启动时按版本号自动安装/更新进 web profile（`dsh plugin --profile web add file:...`，首次自动初始化 profile，无需网络）；pnpm 缓存重定向到 `/tmp`，不污染 `/workspace`；容器内含 Docker CLI/Compose 并挂载 `docker.sock`（详见「固化插件」一节）。
+- dsh、Authelia、Caddy 都使用 host 网络；容器内 `127.0.0.1` 就是 NAS 宿主机。
+- dsh 由 [`entrypoint.sh`](entrypoint.sh) 强制使用 `--host 127.0.0.1`，不能让局域网绕过 Caddy 和 Authelia 直连 3080。
+- `deploy.sh` 启动后检查 dsh 的实际 listener、Authelia 健康状态和 Caddy admin API listener；关键安全检查失败会返回非零退出码。
+- dsh 主容器不挂载 `/var/run/docker.sock`，运行镜像不安装 Docker CLI/Compose。网页升级已关闭，避免应用进程获得宿主 Docker 控制权。
+- 固化插件只提供安全重启；旧的网页升级 endpoint 仅返回合法的 RPC 错误，不能执行升级。
+- 旧的无域名密码入口已删除。必须使用域名 + Authelia，或使用同一 NAS 上已经终结公网 TLS 的前置反代/Tunnel。
 
-## 目录结构
+## 三种 Caddy 入口模式
 
-```
-dsh-nas/
-├── Dockerfile              # dsh 镜像（node:22-bookworm + tini + pnpm 固定版）
-├── deploy.sh               # 一键部署：配置向导 + 检查 + 构建启动
-├── entrypoint.sh           # 代理环境变量 + 启动 dsh + 自动安装固化插件
-├── docker-compose.yml      # dsh + authelia + caddy 三容器（authelia 挂 profile，主方案才启动）
-├── plugins/
-│   └── restart-dsh/        # 固化插件：设置页「服务控制」（一键重启 / 升级 dsh web）
-│       ├── package.json    #   dsh.bundle + dsh.client 声明
-│       ├── cordis.patch.yml#   bundle patch（一行插入）
-│       ├── index.js        #   host 半：/restart-dsh + /dsh-upgrade RPC
-│       └── client.js       #   client 半：设置页「服务控制」面板（重启 + 升级）
-├── caddy/
-│   └── Caddyfile           # 反代 + 鉴权接入（向导自动生成）
-├── authelia/
-│   ├── configuration.yml   # Authelia 配置（固定 v4.39）
-│   └── users_database.yml  # 用户库（argon2id 密码哈希）
-├── data/                   # 运行时生成（挂载进容器持久化）
-│   ├── dsh/                #   → /home/node/.dsh  配置/凭据/会话/存储/插件
-│   └── workspace/          #   → /workspace       工作区（agent 文件、项目）
-└── .env                    # 运行时生成：DSH_PROXY（--proxy-host 写入，compose 自动读取）
-```
+配置向导会写入 `# dsh-nas-entry-mode: ...` 标记，部署脚本据此恢复模式并执行对应的端口、listener 校验。
+
+### 1. 直连 80/443：`direct-80-443`
+
+适合 DNS 的 A/AAAA 记录直接指向 NAS，且 80、443 都没有被其他服务占用的情况。
+
+- Caddy 监听 80 和 443；
+- HTTP 请求由 Caddy 自动跳转到 HTTPS；
+- 可使用 ACME HTTP-01；
+- 防火墙和公网入口需要放行 80、443；
+- 部署后 Caddy admin API 必须只报告 `:80`、`:443`。
+
+### 2. 直连 443-only：`direct-443-only`
+
+适合 80 被 NAS 管理界面或其他服务占用，但 443 可以交给 Caddy 的情况。
+
+- Caddy 只监听 443；
+- 生成配置使用 `auto_https disable_redirects`，不会提供 HTTP → HTTPS 跳转；
+- 访问必须显式使用 `https://`；
+- 证书申请依赖 Caddy 可用的 ACME challenge，通常需要 TLS-ALPN-01；本模板不把 HTTP-01 当作可用前提。若你的环境只能使用 DNS-01，需要另外配置 Caddy DNS provider；
+- 部署后 Caddy admin API 必须只报告 `:443`。
+
+### 3. 同机前置反代/Tunnel：`front-proxy`
+
+适合 NAS 上已经运行 lucky、OpenResty、Cloudflare Tunnel 等公网 TLS 入口的情况。
+
+- 前置入口负责公网证书和 HTTPS；
+- Caddy 使用 `auto_https off`，只监听 `127.0.0.1:13080`；
+- 前置入口必须把 `dsh.<domain>` 和 `auth.<domain>` 都转发到 Caddy，并保留/设置 `X-Forwarded-Proto: https`；
+- 前置入口必须与 Caddy 位于同一 NAS，或明确具备访问 NAS 回环地址的能力；普通 bridge 网络容器里的 `127.0.0.1` 不是宿主机，因此不应直接照抄该地址；
+- 部署后非回环 listener（例如 `:13080`、`0.0.0.0:13080` 或 NAS 局域网 IP）会硬失败，不能为了兼容性静默暴露内部入口；
+- 公网端口会写入 Authelia URL 和最终访问提示，例如 `https://dsh.example.com:16666`。
+
+如果 443 也被其他服务占用，不能选择直连模式，必须先把公网 TLS 入口交给同机前置代理/Tunnel，并让 Caddy 使用独立内部端口。
 
 ## 前置条件
 
-1. **代理**：NAS 宿主上有代理（Clash 等）监听 7890 端口（HTTP/mixed）。SSH 验证：
+1. **出站代理**：NAS 宿主上有 HTTP/mixed 代理，默认 `127.0.0.1:7890`。验证：
+
    ```sh
-   curl -x http://127.0.0.1:7890 -sI https://api.deepseek.com | head -n 1   # 期望 HTTP/2 200
+   curl -x http://127.0.0.1:7890 -sI https://api.deepseek.com | head -n 1
    ```
-2. **域名**（主方案必需）：`dsh.example.com` 和 `auth.example.com` 的 DNS 记录指向本 NAS。两种入口方式二选一（配置向导会问）：
-   - **Caddy 直连**（有公网 IP 或公网 IPv6 + DDNS）：域名 A/AAAA 记录指向 NAS，防火墙放行 **443**（443-only 设计，不依赖 80——NAS 系统组件占用 80 不影响）；
-   - **lucky / CF Tunnel 反代入口**（无公网 IPv4，走 IPv6 或隧道）：前置反代终结 TLS，Caddy 只监听内部 13080 且仅绑回环（`default_bind 127.0.0.1`），局域网无法绕过 lucky 直连；若 lucky/CF 运行在其它机器上，需把 Caddyfile 全局块的 `default_bind` 改成 `0.0.0.0` 或 NAS 局域网 IP。lucky 用户：在 lucky 里把 `dsh.` 和 `auth.` 两个域名都转发到 `http://127.0.0.1:13080`，开启 WebSocket，加请求头 `X-Forwarded-Proto: https`，绑定你已配置的证书。
-3. **SSH**：能登进 NAS 执行 docker 命令。
+
+   如果代理不在 NAS 本机，使用宿主可达地址，例如 `./deploy.sh --proxy-host 192.168.1.10:7890`，并确保代理允许局域网访问。
+
+2. **域名和 DNS**：需要 `dsh.<domain>` 与 `auth.<domain>` 两个主机名。直连模式将它们解析到 NAS；前置反代模式将它们解析到公网 TLS 入口。
+
+3. **本地目录**：项目目录和运行数据不能位于只读挂载、无法执行 `chown` 的共享目录或不支持 root 写入的远程文件系统。若启用宿主机受限升级请求链路，项目必须安装到 root-owned 的固定路径 `/opt/dsh-nas`，项目目录及父目录不能允许 group/other 写入；运行数据仍可按下方说明由 UID 1000 写入。容器内 UID 1000 需要写入：
+
+   ```sh
+   mkdir -p data/dsh data/workspace \
+     caddy/data caddy/config
+   sudo chown -R 1000:1000 data
+   ```
+
+   Authelia/Caddy 配置文件由宿主机维护并以只读方式挂载；Authelia 的 SQLite/通知数据放在 `authelia/data/`，Caddy 运行数据放在 `caddy/data/` 和 `caddy/config/`，这些数据目录必须能被对应容器写入。`deploy.sh` 会检查目录；权限无法修复时应先在宿主机处理，不要直接跳过安全检查。
+
+4. **SSH 和 Docker 权限**：能在 NAS 上执行 Docker 命令，并且当前用户可以运行 Docker Engine。
 
 ## 快速部署
 
-```sh
-# 1. 上传本目录到 NAS，SSH 进入
-cd dsh-nas
-
-# 2. 修改配置（见下节「Authelia 首次配置」）
-# 3. 数据目录权限（容器内以 UID 1000 运行）
-mkdir -p data/dsh data/workspace && chown -R 1000:1000 data
-
-# 4. 构建并启动（主方案 Authelia 鉴权；首次构建约 10 分钟：native 依赖编译）
-docker compose --profile auth up -d --build
-```
-
-构建网络说明：
-
-- **apt 与 npm、Docker CLI 静态包下载统一走构建时注入的代理**（`--build-arg HTTP_PROXY/HTTPS_PROXY`，由 deploy.sh 自动传入；apt 用 Debian 默认源）。**在 NAS 上构建**时，`127.0.0.1:7890` 是构建容器自身、不是宿主——必须用宿主可达地址：
-  ```sh
-  ./deploy.sh --proxy-host 192.168.1.10    # 换成 NAS 局域网 IP
-  ```
-  并确认 Clash 允许局域网访问（`allow-lan: true`，监听 `0.0.0.0:7890`）。deploy.sh 构建失败时也会打印这条提示。
-
-## 一键部署脚本（推荐）
+推荐只使用部署脚本，因为它会在启动 Compose 前执行 Compose 配置、Authelia 配置和 Caddyfile 语法检查，再执行目录、端口、健康状态和 listener 安全检查：
 
 ```sh
 cd dsh-nas
@@ -85,236 +120,220 @@ chmod +x deploy.sh
 ./deploy.sh
 ```
 
-**配置向导（自动）**：首次运行检测到占位配置（`example.com` 域名、`CHANGE_ME_*` 密钥、占位密码哈希）时，脚本自动进入交互向导，你只需要回答几个问题，其余全部自动完成：
+首次运行时向导会：
 
-- **方案选择**：`1)` 域名 + Authelia 双因素（推荐） / `2)` 纯内网 IP + Basic Auth
-- **代理输入**：输入出站代理地址（构建 + 运行时统一；NAS 上构建容器内 `127.0.0.1` 是容器自身，须填宿主可达 IP，如 `http://192.168.1.10:7890`，并确认 Clash `allow-lan`）→ 写入 `.env`
-- **域名方案**：输入根域（如 `example.com`）→ 自动生成 `auth.`/`dsh.` 子域、证书邮箱（默认 `admin@<根域>`）、自动生成两个随机密钥（`openssl rand`）、自动生成 admin 密码哈希（argon2id，`docker run authelia`）、整体生成 Caddyfile
-- **入口方式**（域名方案内）：`1)` **Caddy 直连公网**（DDNS 解析到 NAS，防火墙放行 443，443-only + TLS-ALPN-01 证书，不依赖 80） / `2)` **lucky / CF Tunnel 反代入口**（前置反代终结 TLS，Caddy 只监听内部 13080，自动加 `X-Forwarded-Proto: https`）；**选 2 后输入公网 HTTPS 端口**（=lucky/CF 监听端口，如 16666），该端口会写进所有公网 URL（`authelia_url`、`default_redirection_url`），浏览器访问形如 `https://dsh.example.com:16666`
-- **内网方案**：输入 Basic Auth 密码 → 自动生成 bcrypt 哈希（`docker run caddy`）、生成 `:13080` + Basic Auth 的 Caddyfile
-- 所有被改写文件先备份为 `.bak`；改完后再进入检查流程
+1. 写入出站代理地址到 `.env`；
+2. 询问根域名、证书邮箱和 Authelia admin 密码；
+3. 让你选择三种 Caddy 入口模式；
+4. 自动生成 Authelia 密钥、用户密码哈希和 Caddyfile；
+5. 为被改写的配置保留 `.bak` 备份；
+6. 检查文件、目录、端口、代理连通性和 Compose 配置；
+7. 构建并启动 dsh、Authelia、Caddy；
+8. 等待健康检查，并验证 dsh、Authelia、Caddy 的实际 listener。
 
-之后脚本自动完成：环境检查（docker/compose）→ 文件完整性 → 配置检查 → 数据目录权限（自动创建并 chown，需要时自动调 sudo）→ 端口检查（3080、按入口模式查 443 或内部 13080、7890 代理连通性）→ 构建启动（主方案自动带 `--profile auth`，**置于 `up` 之前**：`docker compose --profile auth up -d`）→ 等待健康检查 → **验证 dsh 仅监听 127.0.0.1:3080**（host 网络下的安全前提，发现绑定非回环立即报错）→ 打印访问地址。**任何检查未通过会中止并列出修复项**，已配置完成后反复重跑安全（向导自动跳过）。
+### 升级方式和网页升级替代方案
 
-参数：
+当前**不推荐也不提供 dsh 网页直接升级**。不要给 dsh 容器挂载 Docker socket，也不要让通用升级容器拥有整个项目目录的 root 可写权限；Docker socket 基本等价于宿主机 root 控制权。
 
-```sh
-./deploy.sh --skip-build                              # 跳过构建，用现有镜像启动
-./deploy.sh --proxy-host 192.168.1.5:7890             # 代理不在本机 127.0.0.1 时指定；构建与运行时都生效，写入 .env 持久化
-./deploy.sh --setup                                   # 强制重跑配置向导（可换域名/入口/密码；原文件备份为 .bak，Authelia 密钥保留）
-./deploy.sh --latest                                  # 自动升级到 npm 最新版（查询 registry 更新版本号后构建；隐含 --upgrade）
-```
+推荐顺序：
 
-端口冲突时自动交互：备选方案（Basic Auth）的监听端口被占用时，脚本会提示输入新端口（1-65535），校验合法且空闲后**自动改写 Caddyfile** 并继续部署；直接回车则中止。主方案的 443 冲突（直连模式）或 13080 冲突（反代入口模式）需手动处理（多为 NAS 管理界面或其他服务占用；改 `deploy.sh` 顶部 `INTERNAL_PORT` 后可整体换端口）。
-
-注意：`deploy.sh` 必须在 **NAS 的 Linux shell**（SSH）里运行，不要在 Windows Git Bash 里跑——Git Bash 的端口检测、属主检测、chown 语义与 Linux 不同，结果不可靠（可用 `bash -n deploy.sh` 做语法校验）。
-
-## lucky / CF Tunnel 反代入口（无公网 IPv4 场景）
-
-NAS 没有公网 IPv4 时（家庭宽带常见），有两种入口；本方案已内置「反代入口」模式（配置向导选入口方式 2，生成内部 http 版 Caddyfile）。
-
-### lucky 入口端到端流程（14 步）
-
-前置：域名 `dsh.example.com` / `auth.example.com` 已解析到 NAS（IPv6 DDNS 等），lucky 已绑定可用证书。
-
-1. **lucky 反代**：新建反代，监听公网 HTTPS 端口（如 16666），绑定证书；添加两条规则 `dsh.example.com` 和 `auth.example.com`，都转发到 `http://127.0.0.1:13080`，开启 **WebSocket**，每条规则加请求头 **`X-Forwarded-Proto: https`**（详细说明见下节「lucky 用户」）；
-2. **上传部署**：把 `dsh-nas` 目录上传到 NAS，SSH 进入并运行：
+1. **首选：SSH + 宿主机脚本升级**
    ```sh
-   cd 上传路径/dsh-nas && bash deploy.sh
+   ./deploy.sh --upgrade
+   ./deploy.sh --latest
    ```
-3. **代理地址**：按提示输入出站代理。注意：NAS 上构建容器内的 `127.0.0.1` 是容器自身、不是宿主——必须填宿主可达地址（如 `http://192.168.1.10:7890`），并确认 Clash 开了 `allow-lan`；
-4. **访问方案**：选 `1) 域名 + Authelia 双因素`；
-5. **根域**：输入反代的根域（如 `example.com`；不带 `http://`、不带端口号，脚本会校验）；
-6. **证书邮箱**：Let's Encrypt 证书邮箱，直接回车用默认 `admin@<根域>`；
-7. **公网入口方式**：选 `2) lucky / CF Tunnel 等反代入口（前置反代终结 TLS，Caddy 只监听内部端口）`；
-8. **公网端口**：输入 lucky 反代监听的端口（浏览器访问时带 `:端口` 的那个，提示默认 443，lucky 常用 16666）；
-9. **admin 密码**：输入 Authelia 的 admin 登录密码（不回显，需输入两次确认，脚本自动生成 argon2id 哈希）。首次配置时终端还会打印三个自动生成的 Authelia 密钥（session/reset/storage），注意保存；
-10. **等待部署完成**：首次构建约 10 分钟（native 依赖编译）。脚本自动完成检查 → 构建 → 启动 dsh/Authelia/Caddy 三个容器 → 健康检查，任何检查未通过会中止并列出修复项；
-11. **访问**：浏览器输入 `https://dsh.example.com:16666`（端口按第 8 步的实际值）。**第一次必须带 `https://`**——只输 `dsh.example.com:16666` 会被浏览器按 http 访问而失败；
-12. **登录**：页面自动跳转 `auth.example.com`，输入 admin 密码；
-13. **注册 2FA**：按提示开启一次性密码——验证码不会真的发到邮箱，而是写在 NAS 的 `dsh-nas/authelia/notifications.txt`（`cat authelia/notifications.txt` 查看），输入验证码后出现 TOTP 二维码，用手机 Authenticator 扫码添加；
-14. **完成**：重新访问 `https://dsh.example.com:16666`，登录后即可使用。
+   这是当前实现和推荐方式。脚本运行在 NAS 宿主机上，使用 `flock`、原子版本文件、旧镜像快照、健康/listener 校验和失败恢复。
 
-### lucky 用户（推荐，你已有 DDNS + 证书）
+2. **需要网页按钮时：单独的受限升级代理容器**
 
-lucky 继续负责：DDNS（域名 AAAA 记录 → NAS 公网 IPv6）、TLS 终结（你的证书）、公网 443 监听。Caddy 退居内部：
+   可以单独运行一个升级代理，但它不应是“拥有 Docker socket 的通用 Docker 管理器”。更安全的设计是：
+   - 代理只绑定 `127.0.0.1` 或管理网，不暴露公网；
+   - 只接受管理员认证后的固定升级命令；
+   - 只允许固定项目目录、固定 Compose project、固定服务名 `dsh`；
+   - 只允许 SemVer 版本规则和固定 registry；
+   - 只允许 `build dsh`、`up/restart`、健康检查、回滚等白名单动作；
+   - 不允许任意 Docker API、任意宿主路径、任意镜像、任意 shell；
+   - 代理本身使用宿主机 systemd/sudo 最小权限，或通过一个极窄的 Unix socket/helper 执行器；
+   - 必须有 CSRF/Origin 校验、速率限制、审计日志、并发锁和可验证的回滚状态。
 
-```
-浏览器 → https://dsh.example.com → lucky（443，证书）→ http://127.0.0.1:13080
-       → Caddy（内部 http，按域名路由）→ Authelia → dsh
-```
+   如果只能通过 Docker socket 控制 Docker，风险仍然接近宿主 root；这类容器不能作为默认推荐方案。**单独开一个普通升级 Docker 并不能自动变安全**，关键是权限和命令白名单。
 
-lucky 配置（3 步）：
+3. **当前落地方案：网页/管理端只签发 `upgrade-request.json`，宿主机 systemd timer 执行**
 
-1. **反代 → 新建**：监听你的**公网 HTTPS 端口**（如 16666；监听地址留空 = 全部接口，含 IPv6）；证书选你已配置的那个；这个端口就是向导里输入的"公网 HTTPS 端口"，浏览器访问 `https://dsh.example.com:16666` 时用；
-2. **两条转发规则**：
-   - `dsh.example.com` → `http://127.0.0.1:13080`（**WebSocket 开启**）
-   - `auth.example.com` → `http://127.0.0.1:13080`
-3. **每条规则加请求头**：`X-Forwarded-Proto: https`（lucky 的"修改请求头"；否则 Authelia 会误判协议为 http，产生错误的 http 重定向）。
+   注意：当前仓库提供的是“请求签发器 + 宿主机处理器”基础链路，dsh 自身尚未接入网页按钮。要接入现有管理页，必须额外实现管理员 capability、CSRF/Origin、速率限制和状态轮询。
 
-> IPv6 防火墙放行你 lucky 反代监听的公网端口（如 16666），而不是 443。
+   本仓库已提供受限请求签发器和宿主机处理器：
 
-> lucky 的 DDNS 若尚未配置：DDNS → 新建 → 选你的 DNS 服务商 → 域名 `dsh.example.com` / `auth.example.com` → 记录类型 **AAAA** → 地址来源"自动检测 IPv6"。
+   ```sh
+   sudo install -d -o root -g root -m 0755 /opt/dsh-nas
+   # 将仓库文件安装到 /opt/dsh-nas，并确保代码树 root-owned、不可被 group/other 写入
+   sudo install -d -o root -g root -m 0700 /var/lib/dsh-nas-upgrade
+   sudo bash /opt/dsh-nas/tools/request-upgrade.sh --init-key
+   sudo bash /opt/dsh-nas/tools/request-upgrade.sh --request --action upgrade --source host-cli
+   # 或由已认证的管理页通过精确 sudo 白名单调用：
+   sudo bash /opt/dsh-nas/tools/request-upgrade.sh --request --action latest --source web-admin
+   ```
 
-### CF Tunnel 用户（备选）
+   处理器由 `systemd/dsh-upgrade-request.timer` 定期调用 `tools/process-upgrade-request.sh`，只接受 `upgrade`/`latest` 两个动作。它会检查 root 所有权、`0600/0700` 权限、请求时效、严格字段格式和 HMAC-SHA256 签名，然后只执行固定项目的 `deploy.sh --upgrade` 或 `--latest`。执行结果写入 root-only 的 `/var/lib/dsh-nas-upgrade/upgrade-status.json`，请求归档到 `processed/`、`failed/` 或 `rejected/`。
 
-Zero Trust → Tunnels → 创建隧道（token 模式）→ Public Hostnames 添加两条：`dsh.example.com` 和 `auth.example.com` → 服务都填 `http://127.0.0.1:13080`。隧道容器需出站走代理（`HTTPS_PROXY` 指向 7890）。
+   处理器还会逐级检查 `/opt/dsh-nas` 代码目录及父目录、关键 Compose/Dockerfile/脚本配置是否 root-owned、不可被 group/other 写入且不是符号链接；HMAC 不能替代代码完整性校验。请求使用固定的单行 canonical JSON，拒绝未知字段、重复字段、换行和尾随内容；验签后、执行前以原子方式占用 `request_id`，再安全归档到 `processed/`/`failed/`，因此不能重放或覆盖同名归档。
 
-## Authelia 首次配置（5 步）
+   systemd unit 已固定使用 `/opt/dsh-nas` 和 `/var/lib/dsh-nas-upgrade`；不要把它改成普通用户可写目录。然后执行：
 
-> 以下步骤 `./deploy.sh` 的配置向导会自动完成；手动配置时参考。
+   ```sh
+   sudo install -m 0644 systemd/dsh-upgrade-request.service /etc/systemd/system/
+   sudo install -m 0644 systemd/dsh-upgrade-request.timer /etc/systemd/system/
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now dsh-upgrade-request.timer
+   ```
 
-**① 替换域名占位符**：把 `caddy/Caddyfile` 和 `authelia/configuration.yml` 里的 `example.com` 全部换成你的域名（cookie 挂父域，所以必须是"可注册域"，如 `example.com`、`duckdns.org`）。
+   管理页只能调用签发器和只读状态读取器 `tools/read-upgrade-status.sh`，不能调用处理器、`deploy.sh` 或 Docker CLI；应使用精确的 sudoers 白名单，不应允许任意参数。该方案仍然需要管理页自身完成管理员认证、CSRF/Origin 校验和速率限制。请求控制目录和升级快照不放在容器 UID 1000 可写的 `data/` 下，而放在 root-only 的 `/var/lib/dsh-nas-upgrade`。
 
-**② 生成两个随机密钥**，填进 `authelia/configuration.yml` 的 `CHANGE_ME_*`：
+   在受限请求链路部署前，也可以继续使用 SSH 手工执行升级。
 
-```sh
-openssl rand -hex 32
-```
-
-**③ 生成用户密码哈希**，填进 `authelia/users_database.yml` 的 `password` 字段：
-
-```sh
-docker run --rm authelia/authelia:4.39 authelia crypto hash generate argon2 --password '你的密码'
-```
-
-**④ 启动**：
+### 常用参数
 
 ```sh
-docker compose --profile auth up -d --build
+./deploy.sh --skip-build                    # 使用已有 dsh 镜像启动
+./deploy.sh --proxy-host 192.168.1.10:7890  # 设置构建和运行时代理
+./deploy.sh --setup                          # 重新选择域名、入口或密码
+./deploy.sh --upgrade                        # 使用 Dockerfile 当前版本重建 dsh
+./deploy.sh --latest                         # 查询 npm latest，只更新 Dockerfile 版本并重建
 ```
 
-**⑤ 注册 TOTP**（只需一次）：浏览器打开 `https://auth.example.com` → 用 admin 和密码登录 → 按提示用手机 Authenticator（Google/Microsoft/Aegis 等）扫码并输入一次性码。验证码会先写入 NAS 上的 `authelia/notifications.txt`，从那里读取：
+`--upgrade` 和 `--latest` 会跳过配置向导，并在构建前保存 Dockerfile、Compose、`.env`、Caddy/Authelia 配置、旧 dsh 镜像 ID 和运行容器配置。升级要求已有可恢复的 `dsh:local` 镜像，并使用 GNU `flock` 防止并发升级。版本文件采用同目录临时文件、fsync 和原子替换；构建、启动、健康检查或 listener 校验失败时，脚本会尝试恢复旧版本文件、旧镜像 tag 和 dsh 服务，并等待验证 dsh、Authelia、Caddy healthy、listener 和 API；只有确认容器或镜像实际发生切换时才停止并重启旧栈。恢复失败仍会以非零退出。该流程是受限的单机回滚保护，不是蓝绿发布；运行数据位于 `data/`，不会因正常重建而删除。
 
-```sh
-cat authelia/notifications.txt
-```
+不要在 Windows Git Bash 中运行部署脚本；端口、属主和 `chown` 语义必须由 NAS 的 Linux shell 提供。
 
-之后访问 `https://dsh.example.com`，未登录会自动跳转登录页。
+## 构建和版本
+
+- dsh 版本唯一来源是 [`Dockerfile`](Dockerfile) 构建阶段的 `ARG DSH_VERSION`。
+- `docker-compose.yml` 不再重复声明 dsh 版本，也不向 dsh 容器注入 Docker socket。
+- 构建阶段的 apt/npm 下载使用部署脚本传入的 `HTTP_PROXY`/`HTTPS_PROXY`。NAS 上的 `127.0.0.1` 对构建容器不是宿主机，代理通常需要填写 NAS 局域网地址。
+- 运行阶段使用 `.env` 中的 `DSH_PROXY`；`NO_PROXY` 至少应包含 `127.0.0.1,localhost`。
+- 首次构建需要编译 native 依赖，耗时取决于 NAS CPU 和代理速度。
+
+## Authelia 首次配置
+
+向导会自动完成以下工作；手动配置时参考：
+
+1. 把 `authelia/configuration.yml`、`authelia/users_database.yml` 和 Caddyfile 中的域名替换为真实域名；首次部署前创建 `authelia/data/`；
+2. 用随机值替换 `CHANGE_ME_*` 密钥；
+3. 生成 argon2id 密码哈希：
+
+   ```sh
+   docker run --rm authelia/authelia:4.39 \
+     authelia crypto hash generate argon2 --password '你的密码'
+   ```
+
+4. 使用 `docker compose --profile auth up -d` 启动 Authelia；
+5. 第一次登录后按提示注册 TOTP。文件通知器会把初始验证码写到 `authelia/data/notifications.txt`，读取后应妥善保护或清理该文件。
+
+## 前置反代配置要点
+
+以同一 NAS 上的 lucky 为例：
+
+1. 配置公网 HTTPS listener 和证书；
+2. 建立两条规则：
+   - `dsh.<domain>` → `http://127.0.0.1:13080`；
+   - `auth.<domain>` → `http://127.0.0.1:13080`；
+3. dsh 规则开启 WebSocket；
+4. 两条规则都设置 `X-Forwarded-Proto: https`；
+5. 让向导中的公网端口与 lucky 实际监听端口一致。
+
+如果是 Cloudflare Tunnel 或其他容器化前置入口，应确认它使用 host 网络或其他明确的宿主访问方式；bridge 网络中的 `127.0.0.1:13080` 通常会指向前置容器自身。
 
 ## 使用与运维
 
 ```sh
-docker compose ps                 # 查看状态
-docker compose logs -f dsh        # dsh 日志
-docker compose logs -f authelia   # 鉴权日志
-docker compose restart dsh        # 重启 dsh（装插件后必须）
+docker compose ps
+docker compose logs -f dsh
+docker compose logs -f authelia
+docker compose logs -f caddy
+docker compose restart dsh
 ```
 
-升级 dsh（推荐）：设置 → 服务控制 → 升级 dsh——点击「获取最新版本」或手动输入版本号，再点击升级。后台自动完成：改 `Dockerfile` 的 `ARG DSH_VERSION`（与 `docker-compose.yml` 的 build arg 保持同步）→ 执行一次 `deploy.sh`（重建镜像 + 重启容器）。Caddy/Authelia 配置、证书与 `data/` 数据不受影响；构建失败时现有服务保持运行。
-
-> 首次使用网页端升级前，需在 NAS 上手动重跑一次 `./deploy.sh` 应用新版部署配置（镜像内 Docker CLI、`docker.sock`/项目文件挂载与属组）。命令行升级：`./deploy.sh --latest` 自动查询 npm 最新版、更新 `Dockerfile`/`docker-compose.yml` 版本号后构建（隐含 `--upgrade`）；或手动改 `Dockerfile` 的 `DSH_VERSION` → `docker compose up -d --build`。数据在 `data/`，不丢。`--upgrade`/`--latest` 模式显式跳过配置向导并在构建前保存 Caddy/Authelia/.env 快照。
-
-安装社区插件（容器内已带 pnpm）：
+固化插件只提供“重启 dsh web”功能。插件随镜像安装到 web profile；社区插件仍可使用 dsh CLI 管理：
 
 ```sh
 docker exec -it dsh dsh plugin --profile web add <插件包名>
-docker compose restart dsh        # 插件启动时组合进配置树，必须重启
+docker compose restart dsh
 ```
 
-插件管理注意事项（违规会导致容器起不来或升级失效）：
-
-- **删除插件必须用 CLI**：`docker exec -it dsh dsh plugin --profile web remove <插件名>`。profile 的 `package.json` 里有**两处**记录——`dependencies` 依赖与 `dsh.profile.bundles` 注册表，手工只清一处会留下死引用：轻则升级时 pnpm 安装报 ENOENT（固化插件更新被阻断，升级功能失效），重则启动报 `cannot resolve profile bundle`（容器崩溃循环）；
-- **`file:/workspace/...` 方式安装的插件，源目录不能删/移**：下次容器重启时 pnpm 解析会 ENOENT。要删这类插件：先 `remove`，再删源目录，顺序不能反；
-- **升级/重建镜像不影响已装插件**：社区插件存放在 `data/dsh/profiles/web/`（持久卷），不在镜像内；entrypoint 的固化安装逻辑只管 `restart-dsh` 一个插件。
-
-## 固化插件「服务控制」（重启 / 升级 dsh）
-
-镜像内置 `plugins/restart-dsh`：设置面板新增「服务控制」页，提供一键重启与升级 dsh 两项能力。
-
-**一键重启**：Host 半向容器 PID 1（tini）发送 SIGTERM → tini 转发给 dsh → 进程退出 → 容器由 `restart: unless-stopped` 自动拉起；RPC 走 `connection.rpc` 通道（`authority: 'loopback'`，与 `/api` 同款信任栅栏）。
-
-**一键升级**：点击「获取最新版本」查询 npm registry 的 `@deepseek-ai/dsh` latest tag，也可手动输入版本号。确认后，插件启动一次性后台容器 `dsh-upgrader`：
-
-1. 复用本地 `dsh:local` 镜像，以 root + host 网络运行，挂载宿主 `docker.sock`；项目目录**按原宿主路径**挂载——不能用 `/project` 之类的内部别名，`deploy.sh` 里 compose 的相对 bind（`./data/dsh` 等）按宿主路径解析，挂错名字会让 daemon 在宿主根下自动创建空的 `/project/data/dsh`，重建的容器挂到空数据目录直接启动失败；
-2. 将版本写入 `Dockerfile` 的 `ARG DSH_VERSION` 和 `docker-compose.yml` 的 build arg，然后以 `--upgrade` 模式执行一次 `deploy.sh`；升级容器以 root 运行，执行前后都会把 `data/dsh` 属主修正为 1000:1000，防止属主漂移导致新容器 entrypoint 的可写检查失败；
-3. `--upgrade` 显式跳过配置向导，并在构建前把 Caddyfile、Authelia 配置和 `.env` 快照到 `data/upgrade-config-backup/`；不会重写 Caddyfile / Authelia 配置，只重新构建 dsh 镜像并重新拉取对应 npm 版本，Caddy/Authelia 配置、证书与 `data/` 数据保留；
-4. 进度写入 `data/upgrade-run.log` / `data/upgrade-run.exit`，设置页轮询展示日志尾部与结果。容器重建期间页面断开属正常，稍后刷新即可查看最终状态；
-5. 构建失败时 `up -d` 不执行，现有服务保持运行，可查看 `data/upgrade-run.log`。
-
-**首次启用网页端升级**：拉取本次代码后，必须先在 NAS 上手动运行一次 `./deploy.sh`，应用以下新配置：
-
-- `dsh` 服务挂载项目版本文件、`data/`、`/var/run/docker.sock`；
-- `deploy.sh` 自动检测 socket 属组并写入 `.env` 的 `DOCKER_GID`，Compose 用 `group_add` 授权；
-- `Dockerfile` 运行阶段安装 Docker CLI 与 Compose 插件，供升级容器执行 `deploy.sh`。
-
-安全提示：挂载 `docker.sock` 等价于宿主 root 权限；dsh 仍只监听回环，必须保持 Caddy + Authelia 鉴权链路，不要直接暴露 3080。若 NAS 的 socket 是 `root:root` 或属组无读写权限，网页端升级会自动禁用，但命令行升级不受影响。
-
-- **自动安装/更新插件**：`entrypoint.sh` 启动时对比镜像内插件与持久化 profile 中的 `package.json` 版本，不一致则重新执行 `dsh plugin --profile web add file:/opt/dsh-plugins/restart-dsh`；本地包无需网络，失败不阻塞启动（报错细节写入 `/tmp/plugin-add.log` 并在容器日志回显）；pnpm 缓存已重定向到 `/tmp`，不污染 `/workspace`。pnpm 对 `file:` 依赖可能复用旧副本而不更新内容（安装"成功"但版本不变），安装后校验实际版本，仍不一致时删除 profile 副本手工同步镜像内版本；
-- **手动重装**（如需）：
-
-  ```sh
-  docker exec -it dsh dsh plugin --profile web remove @dsh-nas/restart-dsh
-  docker exec -it dsh dsh plugin --profile web add file:/opt/dsh-plugins/restart-dsh
-  docker compose restart dsh
-  ```
-
-- 插件随镜像固化：重建镜像（`docker compose up -d --build`）后自动生效，不依赖会话级动态插件。
-
-## 无域名、纯内网 IP 的备选方案
-
-不想搞域名时，用 **Caddy 内置 Basic Auth**：打开 `caddy/Caddyfile` 末尾注释掉的 `:13080` 块、注释掉上面两个站点块，然后**不带** `--profile auth` 启动（authelia 容器不会被拉起，无需从 docker-compose.yml 删除）。密码哈希：
+删除插件也应使用 CLI，避免 profile 的依赖和 bundle 注册表只删除一半：
 
 ```sh
-docker run --rm caddy caddy hash-password --plaintext '你的密码'
+docker exec -it dsh dsh plugin --profile web remove <插件名>
+docker compose restart dsh
 ```
-
-访问 `http://<NAS IP>:13080`，浏览器弹窗输密码（首次输入后自动缓存，WebSocket/SSE 不受影响）。这个方案适合纯内网；出公网请务必用上面的 Authelia 方案或 Tailscale。
 
 ## 常见问题
 
 | 现象 | 处理 |
 |---|---|
-| 访问 dsh 显示 401 而不是登录页 | Caddyfile 的 `@authfail`/`handle_response` 块被改过或 Caddyfile 没生效（`docker compose restart caddy`）；确认 `authelia_url` 参数与 `session.cookies[].authelia_url` 一致 |
-| 登录后跳回登录页（循环） | Authelia 日志里的 session domain 警告：`configuration.yml` 的 `cookies[].domain` 必须是你域名的公共父域（如 `example.com`），且与访问域名匹配 |
-| Authelia 提示 configuration invalid | 检查 CHANGE_ME 是否都替换了；`docker compose logs authelia` 看具体报错 |
-| TOTP 注册码在哪 | `cat authelia/notifications.txt`（文件通知器写入的） |
-| 证书申请失败（直连模式） | 域名 AAAA/A 记录是否指向 NAS；防火墙是否放行 **443**（IPv6 也放行）；`docker compose logs caddy` 看 TLS-ALPN-01 结果 |
-| 登录后跳回登录页（循环） | Authelia 配置的 cookie 域与访问域名不匹配；或反代入口模式漏了 `X-Forwarded-Proto: https` |
-| 反代入口模式打不开 | lucky/CF 里两条规则是否都指向 `http://127.0.0.1:13080`；Caddy 内部 13080 是否被其他服务占用 |
-| 内网用域名访问超时 | NAT hairpin（回流）问题：路由器开 NAT loopback，或改用 hosts 记录 |
-| 模型请求超时/连接失败 | 确认宿主 `127.0.0.1:7890` 可达（见前置条件）；`docker compose logs dsh` 看有无 `TRANSPORT` 错 |
-| 页面能开但流式输出卡住 | 确认没动 Caddyfile 的 `reverse_proxy` 块（Caddy 默认流式，无需额外配置） |
-| 网页端升级失败 | 查看 `data/upgrade-run.log` 和 `data/upgrade-config-backup/`；常见原因是 npm 版本不存在、构建代理不通（`.env` 的 `DSH_PROXY`）或 `docker.sock` 无权限（重跑 `./deploy.sh` 检测 `DOCKER_GID`）。失败时现有服务保持运行 |
-| 升级后 dsh 反复重启报 `profiles 不可写` | 旧版升级逻辑把项目目录挂成内部别名，compose 相对 bind 解析错位，daemon 在宿主根自动创建了空的 `/project/data/dsh`（root 属主）。`docker inspect dsh` 看 Mounts：出现 `/project` 即中招——从真实项目目录重跑 `./deploy.sh`，再删除宿主残留的 `/project` 目录 |
-| 插件装不上 / 报 `cannot resolve profile bundle` | profile 里残留失效的 `file:` 依赖（源目录已删）：清理 `data/dsh/profiles/web/package.json` 的 `dependencies` 死引用及 `dsh.profile.bundles` 数组对应条目；`dsh plugin add` 的报错细节看容器日志的 `install error details` 段 |
-| 升级后 dsh 起不来 | SSH 把 `Dockerfile` 的 `DSH_VERSION` 改回旧版本，再运行 `./deploy.sh` 回滚；`data/` 数据不受影响 |
-| 数据目录权限错误 | `chown -R 1000:1000 data`（或 `data/dsh data/workspace`） |
-| 连局域网 Ollama/本地模型 | 把它加进 `NO_PROXY`：`NO_PROXY=127.0.0.1,localhost,192.168.x.x` |
-| 插件装完不生效 | 装完必须 `docker compose restart dsh` |
+| 配置向导拒绝继续 | 检查域名、密钥、用户哈希和 Caddyfile 模式标记；必要时运行 `./deploy.sh --setup`。 |
+| 80 被占用 | 如果 443 空闲，选择 443-only；如果 443 也被占用，使用同机前置反代/Tunnel。 |
+| 443-only 证书申请失败 | 检查 A/AAAA、IPv6 防火墙和 443 可达性；查看 `docker compose logs caddy`。该模式不提供 80 跳转。 |
+| 前置反代模式打不开 | 确认 dsh/auth 两个域名都转发到 `127.0.0.1:13080`，开启 WebSocket，并设置 `X-Forwarded-Proto: https`。 |
+| 部署报告 Caddy 非回环 listener | 不要忽略；检查 Caddyfile 的 `default_bind 127.0.0.1` 和是否加载了旧配置。 |
+| 未登录时出现 401 或跳转循环 | 检查 Authelia URL、cookie domain、前置代理的 `X-Forwarded-Proto` 和 Caddy `forward_auth` 块。 |
+| dsh 反复重启或 profiles 不可写 | 在宿主机执行 `sudo chown -R 1000:1000 data/dsh data/workspace`，检查挂载是否位于可写本地目录。 |
+| 模型请求超时 | 检查 `DSH_PROXY`、宿主代理监听地址和 `docker compose logs dsh`。 |
+| 流式输出或 WebSocket 异常 | 检查前置代理是否启用 WebSocket；不要删除 Caddy 的 `reverse_proxy` 配置。 |
+| CLI 升级失败 | 脚本会尝试恢复事务快照、旧镜像和 dsh 服务；若恢复报告失败，保留事务目录并按提示检查 `Dockerfile`、`dsh:local` 和 Compose 状态。 |
+| 想使用网页升级 | 当前不提供。请通过 NAS SSH 运行 `./deploy.sh --upgrade` 或 `--latest`。 |
 
-## 安全提醒（重要）
+## 安全要求
 
-- **dsh Web 没有认证层**，靠 Caddy + Authelia 补；**不要**绕过 Caddy 直接暴露 3080 端口。
-- Authelia 默认 `two_factor`：登录需密码 + TOTP。手机 Authenticator 请备份（丢失需重配，Authelia 提供一次性备份码）。
-- `authelia/notifications.txt` 含验证码，部署完可删除内容（Authelia 会继续追加）。
-- 代理端口 7890 只监听内网；公网端口只开 80/443。
-- 网页端升级挂载了 `docker.sock`（等价宿主 root 权限），务必保持 Caddy + Authelia 鉴权链路完整，不要把 3080 直接暴露到局域网/公网。
+- 不要把 dsh 的 3080 暴露到局域网或公网；它没有独立认证层。
+- 不要给 dsh 容器挂载 Docker socket；Docker socket 等价于接近宿主 root 的控制权。
+- 不要用未加密的公网 HTTP 前置入口；公网 TLS 必须由 Caddy 直连模式或同机前置代理/Tunnel 终结。
+- 保持 `authelia/`、`.env`、Caddy 证书数据和通知文件的宿主权限最小化。
+- 443-only 不会自动把 HTTP 跳转到 HTTPS；用户必须使用正确的 `https://` URL。
 
-## UI 手动创建（不支持 compose 的 NAS）
+## 目录结构
 
-镜像：先在有 Docker 的机器执行 `docker build -t dsh:local .` 后用 `docker save/load` 导入（authelia/caddy 直接拉官方镜像），然后创建三个容器，网络模式全部选 **host**：
-
-| 容器 | 镜像 | 卷映射 | 环境变量 |
-|---|---|---|---|
-| dsh | `dsh:local` | `data/dsh` → `/home/node/.dsh`、`data/workspace` → `/workspace`；网页端升级还需挂载 `Dockerfile`、`docker-compose.yml`、`data/` 和 `/var/run/docker.sock` | `NODE_USE_ENV_PROXY=1`、`HTTP_PROXY=http://127.0.0.1:7890`、`HTTPS_PROXY=http://127.0.0.1:7890`、`NO_PROXY=127.0.0.1,localhost`（代理不在本机时把 127.0.0.1 换成代理地址） |
-| authelia | `authelia/authelia:4.39`（固定版，配置按此编写，仅主方案需要） | `authelia/` → `/config` | 无 |
-| caddy | `caddy:2-alpine` | `caddy/Caddyfile` → `/etc/caddy/Caddyfile`（只读）、`caddy/data` → `/data`、`caddy/config` → `/config` | 无 |
-
-重启策略全部选"退出时重启"；dsh 的健康检查命令：`node -e "fetch('http://127.0.0.1:3080').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"`（间隔 30s、超时 5s、重试 3 次）。
+```text
+dsh-nas/
+├── Dockerfile
+├── deploy.sh
+├── entrypoint.sh
+├── docker-compose.yml
+├── plugins/restart-dsh/
+├── tools/
+│   ├── request-upgrade.sh          # 创建带 HMAC 的 upgrade-request.json
+│   ├── process-upgrade-request.sh  # 宿主机 root 受限处理器
+│   └── read-upgrade-status.sh      # 只读升级状态
+├── systemd/
+│   ├── dsh-upgrade-request.service
+│   └── dsh-upgrade-request.timer
+├── caddy/
+│   ├── Caddyfile
+│   ├── data/       # Caddy 证书和运行数据
+│   └── config/     # Caddy 配置状态
+├── authelia/
+│   ├── configuration.yml       # root-owned，容器只读挂载
+│   ├── users_database.yml      # root-owned，容器只读挂载
+│   └── data/                   # SQLite/通知文件，由 Authelia 写入
+├── data/
+│   ├── dsh/        # → /home/node/.dsh，UID 1000
+│   └── workspace/  # → /workspace，UID 1000
+└── .env            # deploy.sh 生成的 DSH_PROXY
+```
 
 ## 文件说明
 
 | 文件 | 作用 |
 |---|---|
-| `Dockerfile` | dsh 镜像：node:22-bookworm + tini（PID 1）+ 固定版本 pnpm@11.20.0 + Docker CLI/Compose + node 用户（UID 1000）；`/home/node/.dsh` 与 `/workspace` 分离 |
-| `entrypoint.sh` | 设置代理环境变量（`NODE_USE_ENV_PROXY=1` 是 Node fetch 走代理的总开关）；显式 `dsh web --host 127.0.0.1` 绑定回环；启动前按版本号自动安装/更新固化插件 |
-| `docker-compose.yml` | 三容器编排，host 网络，健康检查，自动重启；dsh 挂载 docker.sock、版本文件和升级日志，使用 `.env` 的 `DOCKER_GID` 授权；authelia 挂 `auth` profile |
-| `plugins/restart-dsh/` | 固化插件「服务控制」：host 半注册 `/restart-dsh` 与 `/dsh-upgrade` RPC（重启或启动一次性升级容器执行 `deploy.sh`）；client 半注册设置页面板（重启确认 + 版本/日志/结果） |
-| `caddy/Caddyfile` | 反代 + forward_auth + Host/Origin 改写 + 内网 Basic Auth 备选 |
-| `authelia/configuration.yml` | Authelia v4.39 配置（SQLite 单实例、文件通知器） |
-| `authelia/users_database.yml` | 用户库（argon2id 密码哈希） |
+| `Dockerfile` | 构建 dsh 镜像；唯一的 dsh 版本来源是 `ARG DSH_VERSION`。 |
+| `entrypoint.sh` | 设置代理、检查 DSH_HOME 可写性、安装固化重启插件，并以 `127.0.0.1` 启动 dsh。 |
+| `docker-compose.yml` | dsh、Authelia、Caddy 的 host-network Compose V2 编排和健康检查；dsh 无 Docker socket。 |
+| `plugins/restart-dsh/` | 只提供安全重启 RPC/UI；网页升级关闭。 |
+| `caddy/Caddyfile` | 向导生成的三种入口模式、forward_auth 和反向代理配置。 |
+| `authelia/configuration.yml` | Authelia 4.39 配置；容器只读挂载。 |
+| `authelia/users_database.yml` | Authelia 用户库和 argon2id 密码哈希；容器只读挂载。 |
+| `authelia/data/` | Authelia SQLite 和通知文件，由容器写入。 |
 
 ## 许可证
 
-MIT（见 [LICENSE](LICENSE)）
+MIT（见 [LICENSE](LICENSE)）。

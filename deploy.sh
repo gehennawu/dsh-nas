@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# dsh-nas 一键部署脚本
+# dsh-nas Linux NAS 一键部署脚本
 # 检查：环境 / 文件完整性 / 密钥与域名占位符 / 数据目录权限
 #       / 端口冲突 / 代理连通性，然后构建并启动、等待健康，
 #       最后验证 dsh 仅监听回环（host 网络下的安全前提）。
@@ -22,11 +22,42 @@ SKIP_BUILD=0
 SETUP_FORCE=0
 UPGRADE_MODE=0
 LATEST_MODE=0
-ALT_MODE=0
-ALT_PORT=13080          # 备选方案（内网 Basic Auth）监听端口
+UPGRADE_ROLLBACK_ARMED=0
+UPGRADE_COMMITTED=0
+UPGRADE_SWITCHED=0
+UPGRADE_SWITCH_ATTEMPTED=0
+UPGRADE_LOCK_FD=9
+UPGRADE_TXN_DIR=""
+# 升级快照和锁必须脱离 UID 1000 可写的运行数据目录，避免回滚时被容器篡改。
+# CLI 直接升级默认把事务快照放在项目 data 下；受限 systemd 处理器显式传入
+# root-only 的 /var/lib/dsh-nas-upgrade，避免容器 UID 1000 可写目录影响 root 回滚。
+UPGRADE_RESTRICTED_MODE="${DSH_NAS_RESTRICTED_UPGRADE:-0}"
+UPGRADE_STATE_ROOT="${DSH_NAS_UPGRADE_STATE_DIR:-$SCRIPT_DIR/data/upgrade-config-backup}"
+UPGRADE_BACKUP_ROOT="$UPGRADE_STATE_ROOT/config-backup"
+UPGRADE_ENV_EARLY_DIR=""
+COMPOSE=""
+UPGRADE_OLD_DSH_EXISTS=0
+UPGRADE_OLD_AUTHELIA_EXISTS=0
+UPGRADE_OLD_CADDY_EXISTS=0
+UPGRADE_OLD_DSH_RUNNING=0
+UPGRADE_OLD_AUTHELIA_RUNNING=0
+UPGRADE_OLD_CADDY_RUNNING=0
+UPGRADE_OLD_STACK_RUNNING=0
+UPGRADE_OLD_DSH_CONTAINER_ID=""
+UPGRADE_OLD_AUTHELIA_CONTAINER_ID=""
+UPGRADE_OLD_CADDY_CONTAINER_ID=""
+UPGRADE_OLD_DSH_IMAGE_REF=""
+UPGRADE_OLD_AUTHELIA_IMAGE_REF=""
+UPGRADE_OLD_CADDY_IMAGE_REF=""
+UPGRADE_ENV_SNAPSHOT_READY=0
+UPGRADE_ENV_ROLLBACK_ARMED=0
+UPGRADE_FULL_SNAPSHOT_READY=0
 INTERNAL_PORT=13080     # 反代入口模式（lucky/CF）Caddy 内部 http 监听端口
-ENTRY_MODE=1   # 主方案公网入口：1=Caddy 直连（443-only） / 2=lucky 等反代入口（内部 http）
-PUBLIC_PORT=443         # 公网访问 HTTPS 端口（lucky/CF 监听端口；443 则 URL 不带端口）
+MODE_DIRECT_80_443='direct-80-443'
+MODE_DIRECT_443_ONLY='direct-443-only'
+MODE_FRONT_PROXY='front-proxy'
+ENTRY_MODE="$MODE_DIRECT_443_ONLY"  # 向导生成并写入 Caddyfile 标记；旧配置兼容回退为 443-only
+PUBLIC_PORT=443         # 公网访问 HTTPS 端口（前置反代监听端口；443 则 URL 不带端口）
 
 # 公网 URL 辅助：443 端口省略，非标端口带上 :PORT
 pub_url() { # $1=host
@@ -73,7 +104,36 @@ while [ $# -gt 0 ]; do
   shift
 done
 
+if [ "$UPGRADE_RESTRICTED_MODE" = 1 ] && [ "$UPGRADE_MODE" -ne 1 ]; then
+  echo "错误: 受限升级处理器只能以 --upgrade 或 --latest 调用" >&2
+  exit 1
+fi
+if [ "$UPGRADE_MODE" -eq 1 ] && [ "$SKIP_BUILD" -eq 1 ]; then
+  echo "错误: --upgrade/--latest 不能与 --skip-build 同时使用；升级必须重新构建 dsh 镜像"
+  exit 1
+fi
+
 # ---------- .env 幂等写入（保留其它配置行） ----------
+# 升级模式必须先锁定并保存原始 .env，再允许 --proxy-host 写入新值。
+# 该早期快照只负责恢复 .env；完整配置快照在环境检查阶段继续建立。
+capture_upgrade_env_before_mutation() {
+  [ "$UPGRADE_MODE" -eq 1 ] || return 0
+  [ "$UPGRADE_ENV_SNAPSHOT_READY" -eq 1 ] && return 0
+  mkdir -p "$UPGRADE_ENV_EARLY_DIR" || return 1
+  chmod 700 "$UPGRADE_ENV_EARLY_DIR" 2>/dev/null || return 1
+  rm -f "$UPGRADE_ENV_EARLY_DIR/.env.before" "$UPGRADE_ENV_EARLY_DIR/.env.absent" 2>/dev/null || true
+  if [ -f "$ENV_FILE" ]; then
+    cp -p "$ENV_FILE" "$UPGRADE_ENV_EARLY_DIR/.env.before" || return 1
+    chmod 600 "$UPGRADE_ENV_EARLY_DIR/.env.before" 2>/dev/null || return 1
+    UPGRADE_ENV_EXISTED=1
+  else
+    : > "$UPGRADE_ENV_EARLY_DIR/.env.absent" || return 1
+    chmod 600 "$UPGRADE_ENV_EARLY_DIR/.env.absent" 2>/dev/null || return 1
+    UPGRADE_ENV_EXISTED=0
+  fi
+  UPGRADE_ENV_SNAPSHOT_READY=1
+  UPGRADE_ENV_ROLLBACK_ARMED=1
+}
 env_upsert() { # $1=key $2=value
   touch "$ENV_FILE" 2>/dev/null || return 1
   if grep -q "^$1=" "$ENV_FILE" 2>/dev/null; then
@@ -83,17 +143,328 @@ env_upsert() { # $1=key $2=value
   fi
 }
 
+# 同目录临时文件 + fsync + rename，避免版本/状态文件半写入。
+atomic_replace_file() { # $1=temporary file $2=target file
+  local tmp="$1" target="$2" dir
+  [ -f "$tmp" ] || return 1
+  if [ -e "$target" ]; then
+    chmod --reference="$target" "$tmp" 2>/dev/null || return 1
+    chown --reference="$target" "$tmp" 2>/dev/null || true
+  fi
+  sync -d "$tmp" 2>/dev/null || sync
+  mv -f "$tmp" "$target" || return 1
+  dir=$(dirname "$target")
+  sync -d "$dir" 2>/dev/null || true
+}
+atomic_write_text() { # stdin -> $1
+  local target="$1" tmp
+  tmp=$(mktemp "${target}.tmp.XXXXXX") || return 1
+  if ! cat >"$tmp" || ! atomic_replace_file "$tmp" "$target"; then
+    rm -f "$tmp"
+    return 1
+  fi
+}
+update_dsh_version_atomic() { # $1=validated version
+  local version="$1" file="$SCRIPT_DIR/Dockerfile" tmp count
+  [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$ ]] || return 1
+  count=$(grep -cE '^ARG DSH_VERSION=' "$file" 2>/dev/null || true)
+  [ "$count" -eq 1 ] || return 1
+  tmp=$(mktemp "${file}.tmp.XXXXXX") || return 1
+  if ! cp -p "$file" "$tmp" \
+     || ! sed -i -E "s/^ARG DSH_VERSION=.*/ARG DSH_VERSION=$version/" "$tmp" \
+     || ! atomic_replace_file "$tmp" "$file"; then
+    rm -f "$tmp"
+    return 1
+  fi
+}
+
 # 升级模式只允许改版本并构建 dsh；配置文件由调用方完整保留。
-# 升级容器以 root 运行，不能依赖宿主用户权限来创建快照。
+# 升级快照包含版本文件、配置文件、.env、旧镜像 ID 和运行容器配置。
+upgrade_lock() {
+  [ "$UPGRADE_MODE" -eq 1 ] || return 0
+  mkdir -p "$UPGRADE_STATE_ROOT" "$UPGRADE_BACKUP_ROOT" \
+    || { echo "错误: 无法创建宿主机升级状态目录: $UPGRADE_STATE_ROOT"; exit 1; }
+  chmod 700 "$UPGRADE_STATE_ROOT" "$UPGRADE_BACKUP_ROOT" 2>/dev/null \
+    || { echo "错误: 无法限制宿主机升级状态目录权限"; exit 1; }
+  if [ "$(id -u)" -eq 0 ]; then
+    chown root:root "$UPGRADE_STATE_ROOT" "$UPGRADE_BACKUP_ROOT" 2>/dev/null \
+      || { echo "错误: 宿主机升级状态目录必须属于 root"; exit 1; }
+  fi
+  local state_mode state_owner
+  state_mode=$(stat -c '%a' "$UPGRADE_STATE_ROOT" 2>/dev/null || echo 0)
+  state_owner=$(stat -c '%u' "$UPGRADE_STATE_ROOT" 2>/dev/null || echo -1)
+  [ "$state_mode" = 700 ] && [ "$state_owner" = 0 ] \
+    || { echo "错误: 宿主机升级状态目录必须为 root:root 0700: $UPGRADE_STATE_ROOT"; exit 1; }
+  if [ ! -f "$UPGRADE_STATE_ROOT/.upgrade.lock" ]; then
+    : > "$UPGRADE_STATE_ROOT/.upgrade.lock" || { echo "错误: 无法创建升级锁文件"; exit 1; }
+    chmod 600 "$UPGRADE_STATE_ROOT/.upgrade.lock" 2>/dev/null || exit 1
+    [ "$(id -u)" -ne 0 ] || chown root:root "$UPGRADE_STATE_ROOT/.upgrade.lock" 2>/dev/null || exit 1
+  fi
+  eval "exec $UPGRADE_LOCK_FD>\"$UPGRADE_STATE_ROOT/.upgrade.lock\""
+  if command -v flock >/dev/null 2>&1; then
+    flock -n "$UPGRADE_LOCK_FD" || { echo "错误: 已有另一个升级/部署事务运行；请等待其完成"; exit 1; }
+  else
+    echo "错误: 升级需要 GNU flock 以防止并发覆盖版本和镜像"
+    exit 1
+  fi
+  local suffix="$(date +%Y%m%d-%H%M%S)-$$"
+  UPGRADE_TXN_DIR="$UPGRADE_BACKUP_ROOT/$suffix"
+  while ! mkdir -m 700 "$UPGRADE_TXN_DIR" 2>/dev/null; do
+    suffix="$(date +%Y%m%d-%H%M%S)-$$-$RANDOM"
+    UPGRADE_TXN_DIR="$UPGRADE_BACKUP_ROOT/$suffix"
+  done
+  UPGRADE_BACKUP_DIR="$UPGRADE_TXN_DIR"
+  UPGRADE_ENV_EARLY_DIR="$UPGRADE_BACKUP_DIR/.env-before"
+  mkdir -m 700 "$UPGRADE_ENV_EARLY_DIR" || { echo "错误: 无法创建 .env 早期快照目录"; exit 1; }
+}
+UPGRADE_BACKUP_DIR=""
+UPGRADE_OLD_VERSION=""
+UPGRADE_OLD_IMAGE_ID=""
+UPGRADE_OLD_CONTAINER_CONFIG=""
+UPGRADE_ENV_EXISTED=0
 backup_upgrade_configs() {
-  local backup_dir="$SCRIPT_DIR/data/upgrade-config-backup"
+  local backup_dir="$UPGRADE_BACKUP_DIR"
   mkdir -p "$backup_dir" || return 1
-  for f in "$CADDYFILE" "$AUTHELIA_CONF" "$USERS_DB" "$ENV_FILE"; do
+  if [ "$UPGRADE_ENV_SNAPSHOT_READY" -eq 0 ]; then
+    capture_upgrade_env_before_mutation || return 1
+  fi
+  [ -n "$UPGRADE_OLD_VERSION" ] || true
+  local version_count
+  version_count=$(grep -cE '^ARG DSH_VERSION=' "$SCRIPT_DIR/Dockerfile" 2>/dev/null || true)
+  [ "$version_count" -eq 1 ] || { echo "升级快照失败: Dockerfile 必须恰好有一处 DSH_VERSION"; return 1; }
+  for f in "$SCRIPT_DIR/Dockerfile" "$SCRIPT_DIR/docker-compose.yml" "$CADDYFILE" "$AUTHELIA_CONF" "$USERS_DB" "$ENV_FILE"; do
     [ -f "$f" ] || continue
     cp -p "$f" "$backup_dir/$(basename "$f").before" || return 1
+    chmod 600 "$backup_dir/$(basename "$f").before" 2>/dev/null || return 1
   done
-  printf '%s\n' "$backup_dir" > "$SCRIPT_DIR/data/upgrade-config-backup.path"
+  UPGRADE_OLD_VERSION=$(sed -n 's/^ARG DSH_VERSION=//p' "$SCRIPT_DIR/Dockerfile")
+  UPGRADE_OLD_IMAGE_ID=$(docker image inspect dsh:local --format '{{.Id}}' 2>/dev/null || true)
+  if [ -z "$UPGRADE_OLD_IMAGE_ID" ]; then
+    echo "升级快照失败: dsh:local 旧镜像不存在，无法提供可恢复升级"
+    return 1
+  fi
+  [ -n "$UPGRADE_OLD_VERSION" ] || { echo "升级快照失败: Dockerfile DSH_VERSION 为空"; return 1; }
+  if docker inspect dsh >"$backup_dir/dsh.inspect.before" 2>/dev/null; then
+    UPGRADE_OLD_DSH_EXISTS=1
+    [ "$(docker inspect -f '{{.State.Running}}' dsh 2>/dev/null || echo false)" = true ] && UPGRADE_OLD_DSH_RUNNING=1
+    UPGRADE_OLD_DSH_CONTAINER_ID=$(docker inspect -f '{{.Id}}' dsh 2>/dev/null || true)
+    UPGRADE_OLD_DSH_IMAGE_REF=$(docker inspect -f '{{.Config.Image}}' dsh 2>/dev/null || true)
+  fi
+  if docker inspect dsh-caddy >"$backup_dir/dsh-caddy.inspect.before" 2>/dev/null; then
+    UPGRADE_OLD_CADDY_EXISTS=1
+    [ "$(docker inspect -f '{{.State.Running}}' dsh-caddy 2>/dev/null || echo false)" = true ] && UPGRADE_OLD_CADDY_RUNNING=1
+    UPGRADE_OLD_CADDY_CONTAINER_ID=$(docker inspect -f '{{.Id}}' dsh-caddy 2>/dev/null || true)
+    UPGRADE_OLD_CADDY_IMAGE_REF=$(docker inspect -f '{{.Config.Image}}' dsh-caddy 2>/dev/null || true)
+  fi
+  if docker inspect authelia >"$backup_dir/authelia.inspect.before" 2>/dev/null; then
+    UPGRADE_OLD_AUTHELIA_EXISTS=1
+    [ "$(docker inspect -f '{{.State.Running}}' authelia 2>/dev/null || echo false)" = true ] && UPGRADE_OLD_AUTHELIA_RUNNING=1
+    UPGRADE_OLD_AUTHELIA_CONTAINER_ID=$(docker inspect -f '{{.Id}}' authelia 2>/dev/null || true)
+    UPGRADE_OLD_AUTHELIA_IMAGE_REF=$(docker inspect -f '{{.Config.Image}}' authelia 2>/dev/null || true)
+  fi
+  if [ "$UPGRADE_OLD_DSH_RUNNING" -eq 1 ] || [ "$UPGRADE_OLD_AUTHELIA_RUNNING" -eq 1 ] || [ "$UPGRADE_OLD_CADDY_RUNNING" -eq 1 ]; then
+    UPGRADE_OLD_STACK_RUNNING=1
+  fi
+  printf '%s\n' "$UPGRADE_OLD_VERSION" > "$backup_dir/old-version"
+  printf '%s\n' "$UPGRADE_OLD_IMAGE_ID" > "$backup_dir/old-image-id"
+  chmod 600 "$backup_dir"/* 2>/dev/null || true
+  chmod 700 "$backup_dir" 2>/dev/null || true
+  atomic_write_text "$UPGRADE_STATE_ROOT/upgrade-config-backup.path" <<EOF
+$backup_dir
+EOF
+  UPGRADE_ROLLBACK_ARMED=1
 }
+restore_upgrade_version() {
+  local restore_ok=1 target f
+  if [ -n "$UPGRADE_OLD_VERSION" ] && [ -f "$SCRIPT_DIR/Dockerfile" ]; then
+    update_dsh_version_atomic "$UPGRADE_OLD_VERSION" || restore_ok=0
+  fi
+  # .env 不使用完整快照中的副本：完整快照可能在 --proxy-host 写入之后建立，
+  # 必须使用升级锁建立的最早副本恢复升级前状态。
+  for f in Dockerfile docker-compose.yml Caddyfile configuration.yml users_database.yml; do
+    if [ -f "$UPGRADE_BACKUP_DIR/$f.before" ]; then
+      case "$f" in
+        Caddyfile) target="$CADDYFILE" ;;
+        configuration.yml) target="$AUTHELIA_CONF" ;;
+        users_database.yml) target="$USERS_DB" ;;
+        *) target="$SCRIPT_DIR/$f" ;;
+      esac
+      cp -p "$UPGRADE_BACKUP_DIR/$f.before" "$target" 2>/dev/null || restore_ok=0
+    fi
+  done
+  if [ "$UPGRADE_ENV_ROLLBACK_ARMED" -eq 1 ]; then
+    if [ "$UPGRADE_ENV_EXISTED" -eq 1 ] && [ -f "$UPGRADE_ENV_EARLY_DIR/.env.before" ]; then
+      cp -p "$UPGRADE_ENV_EARLY_DIR/.env.before" "$ENV_FILE" 2>/dev/null || restore_ok=0
+    elif [ "$UPGRADE_ENV_EXISTED" -eq 0 ]; then
+      rm -f "$ENV_FILE" 2>/dev/null || restore_ok=0
+      [ ! -e "$ENV_FILE" ] || restore_ok=0
+    else
+      echo "  ${C_R}回滚: 缺少升级前 .env 快照${C_0}"
+      restore_ok=0
+    fi
+    UPGRADE_ENV_ROLLBACK_ARMED=0
+  fi
+  return "$restore_ok"
+}
+restore_upgrade_image() {
+  [ -n "$UPGRADE_OLD_IMAGE_ID" ] || return 1
+  docker tag "$UPGRADE_OLD_IMAGE_ID" dsh:local >/dev/null 2>&1 || return 1
+  [ "$(docker image inspect dsh:local --format '{{.Id}}' 2>/dev/null)" = "$UPGRADE_OLD_IMAGE_ID" ]
+}
+wait_for_stack_healthy() {
+  local i status authelia_status caddy_status
+  for i in $(seq 1 40); do
+    status=$(docker inspect -f '{{.State.Health.Status}}' dsh 2>/dev/null || echo missing)
+    authelia_status=$(docker inspect -f '{{.State.Health.Status}}' authelia 2>/dev/null || echo missing)
+    caddy_status=$(docker inspect -f '{{.State.Health.Status}}' dsh-caddy 2>/dev/null || echo missing)
+    if [ "$status" = healthy ] && [ "$authelia_status" = healthy ] && [ "$caddy_status" = healthy ]; then
+      return 0
+    fi
+    sleep 3
+  done
+  echo "  ${C_R}回滚健康状态: dsh=${status:-unknown}, authelia=${authelia_status:-unknown}, caddy=${caddy_status:-unknown}${C_0}"
+  return 1
+}
+upgrade_stack_changed() {
+  local current running
+  if [ "$UPGRADE_OLD_DSH_EXISTS" -eq 1 ]; then
+    current=$(docker inspect -f '{{.Id}}' dsh 2>/dev/null || true)
+    [ -n "$current" ] || return 0
+    [ "$current" = "$UPGRADE_OLD_DSH_CONTAINER_ID" ] || return 0
+    running=$(docker inspect -f '{{.State.Running}}' dsh 2>/dev/null || true)
+    if [ "$UPGRADE_OLD_DSH_RUNNING" -eq 1 ]; then
+      [ "$running" = true ] || return 0
+    else
+      [ "$running" != true ] || return 0
+    fi
+  elif docker inspect dsh >/dev/null 2>&1; then
+    return 0
+  fi
+  if [ "$UPGRADE_OLD_AUTHELIA_EXISTS" -eq 1 ]; then
+    current=$(docker inspect -f '{{.Id}}' authelia 2>/dev/null || true)
+    [ -n "$current" ] || return 0
+    [ "$current" = "$UPGRADE_OLD_AUTHELIA_CONTAINER_ID" ] || return 0
+    running=$(docker inspect -f '{{.State.Running}}' authelia 2>/dev/null || true)
+    if [ "$UPGRADE_OLD_AUTHELIA_RUNNING" -eq 1 ]; then
+      [ "$running" = true ] || return 0
+    else
+      [ "$running" != true ] || return 0
+    fi
+  elif docker inspect authelia >/dev/null 2>&1; then
+    return 0
+  fi
+  if [ "$UPGRADE_OLD_CADDY_EXISTS" -eq 1 ]; then
+    current=$(docker inspect -f '{{.Id}}' dsh-caddy 2>/dev/null || true)
+    [ -n "$current" ] || return 0
+    [ "$current" = "$UPGRADE_OLD_CADDY_CONTAINER_ID" ] || return 0
+    running=$(docker inspect -f '{{.State.Running}}' dsh-caddy 2>/dev/null || true)
+    if [ "$UPGRADE_OLD_CADDY_RUNNING" -eq 1 ]; then
+      [ "$running" = true ] || return 0
+    else
+      [ "$running" != true ] || return 0
+    fi
+  elif docker inspect dsh-caddy >/dev/null 2>&1; then
+    return 0
+  fi
+  return 1
+}
+validate_restored_stack() {
+  local listeners
+  wait_for_stack_healthy || return 1
+  listeners=$(listener_addresses 3080 2>/dev/null || true)
+  if [ "$listeners" != "127.0.0.1:3080" ]; then
+    echo "  ${C_R}回滚 listener: dsh 实际为 $(printf '%s ' "$listeners")${C_0}"
+    return 1
+  fi
+  listeners=$(listener_addresses 9091 2>/dev/null || true)
+  if [ "$listeners" != "127.0.0.1:9091" ]; then
+    echo "  ${C_R}回滚 listener: Authelia 实际为 $(printf '%s ' "$listeners")${C_0}"
+    return 1
+  fi
+  if ! http_get 5 "http://127.0.0.1:9091/api/health" | grep -q '"status":"OK"'; then
+    echo "  ${C_R}回滚 API: Authelia /api/health 未通过${C_0}"
+    return 1
+  fi
+  CADDY_LISTENERS=$(caddy_listeners 2>/dev/null || true)
+  if [ -z "$CADDY_LISTENERS" ] || ! caddy_listener_set_ok; then
+    echo "  ${C_R}回滚 listener: Caddy 实际为 $(printf '%s ' "$CADDY_LISTENERS")${C_0}"
+    return 1
+  fi
+  return 0
+}
+rollback_upgrade() {
+  [ "$UPGRADE_MODE" -eq 1 ] || return 0
+  [ "$UPGRADE_ROLLBACK_ARMED" -eq 1 ] || return 0
+  local rollback_ok=1 stack_changed=0
+  echo "  ${C_Y}升级验证失败，恢复旧版本和旧 dsh 镜像...${C_0}"
+  if [ "$UPGRADE_SWITCHED" -eq 1 ]; then
+    stack_changed=1
+  elif [ "$UPGRADE_SWITCH_ATTEMPTED" -eq 1 ] && upgrade_stack_changed; then
+    stack_changed=1
+  fi
+  restore_upgrade_version || rollback_ok=0
+  if ! restore_upgrade_image; then
+    echo "  ${C_R}回滚: 旧 dsh 镜像不可用或无法恢复 tag${C_0}"
+    rollback_ok=0
+  fi
+  if [ "$stack_changed" -eq 1 ] && [ -n "$COMPOSE" ]; then
+    echo "  ${C_Y}回滚: 停止当前 Compose 栈...${C_0}"
+    if ! compose_down_current; then
+      echo "  ${C_R}回滚: 无法停止当前 Compose 栈；请查看 docker compose ps${C_0}"
+      rollback_ok=0
+    fi
+    if [ "$UPGRADE_OLD_STACK_RUNNING" -eq 1 ]; then
+      if ! restore_upgrade_image; then
+        echo "  ${C_R}回滚: 无法重新标记旧 dsh 镜像${C_0}"
+        rollback_ok=0
+      fi
+      echo "  ${C_Y}回滚: 启动旧 Compose 栈...${C_0}"
+      if ! $COMPOSE $PROFILE_ARGS up -d; then
+        echo "  ${C_R}回滚: 无法重新启动旧 Compose 栈；请查看上方 Compose 输出${C_0}"
+        rollback_ok=0
+      elif ! validate_restored_stack; then
+        rollback_ok=0
+      fi
+    else
+      echo "  ${C_Y}回滚: 升级前没有运行中的完整栈，已清理失败的新栈，不重新启动服务${C_0}"
+    fi
+  fi
+  if [ "$rollback_ok" -eq 1 ]; then
+    echo "  ${C_G}旧版本恢复完成${C_0}"
+  else
+    echo "  ${C_R}旧版本恢复失败；请立即检查 Dockerfile、dsh:local 和 Compose 状态${C_0}"
+  fi
+  UPGRADE_ROLLBACK_ARMED=0
+  [ "$rollback_ok" -eq 1 ]
+}
+upgrade_exit_trap() {
+  local rc=$?
+  trap - EXIT INT TERM
+  if [ "$rc" -ne 0 ] && [ "$UPGRADE_COMMITTED" -eq 0 ]; then
+    if [ "$UPGRADE_ROLLBACK_ARMED" -eq 1 ]; then
+      rollback_upgrade || rc=1
+    elif [ "$UPGRADE_ENV_ROLLBACK_ARMED" -eq 1 ]; then
+      echo "  ${C_Y}升级尚未完成，恢复升级前 .env...${C_0}"
+      restore_upgrade_version || rc=1
+    fi
+  fi
+  exit "$rc"
+}
+upgrade_signal_trap() {
+  local signal="$1" code=130
+  [ "$signal" = TERM ] && code=143
+  trap - INT TERM
+  # 显式以 130/143 退出，让 EXIT trap 必然执行 rollback_upgrade；不依赖信号到达时的 `$?`。
+  exit "$code"
+}
+
+# 升级必须在任何 .env 修改前取得锁并创建事务目录；同时安装失败 trap。
+if [ "$UPGRADE_MODE" -eq 1 ]; then
+  upgrade_lock
+  trap upgrade_exit_trap EXIT
+  trap 'upgrade_signal_trap INT' INT
+  trap 'upgrade_signal_trap TERM' TERM
+fi
 
 # ---------- 运行时代理地址（.env 的 DSH_PROXY，compose 自动读取插值） ----------
 # --proxy-host 显式传入 → 写入 .env 持久化；未传入但 .env 有保存值 → 沿用
@@ -110,6 +481,10 @@ SAVED_PROXY=""
 [ -f "$ENV_FILE" ] && SAVED_PROXY=$(sed -n 's/^DSH_PROXY=//p' "$ENV_FILE" | head -n 1)
 SAVED_PROXY="${SAVED_PROXY%$'\r'}"   # .env 被 Windows 编辑器存成 CRLF 时剥掉回车
 if [ "$SET_PROXY_ARG" -eq 1 ]; then
+  if [ "$UPGRADE_MODE" -eq 1 ] && ! capture_upgrade_env_before_mutation; then
+    echo "错误: 无法在升级前保存原始 .env，拒绝修改代理配置"
+    exit 1
+  fi
   if [ "$PROXY" != "$SAVED_PROXY" ]; then
     env_upsert DSH_PROXY "$PROXY"
     ok "运行时代理已写入 $ENV_FILE：DSH_PROXY=$PROXY"
@@ -119,25 +494,8 @@ elif [ -n "$SAVED_PROXY" ]; then
   echo "  沿用 .env 保存的代理: $PROXY（--proxy-host 可覆盖）"
 fi
 
-# ---------- 升级功能：记录 docker.sock 属组（.env DOCKER_GID） ----------
-# 容器内 node 用户通过 compose 的 group_add 加入该组，才能驱动宿主 Docker。
-# 若 NAS 把 socket 设为 root:root 或没有 group rw，网页端升级会自动禁用；命令行不受影响。
-if [ -S /var/run/docker.sock ]; then
-  SOCK_GID=$(stat -c %g /var/run/docker.sock 2>/dev/null || echo 0)
-  SOCK_MODE=$(stat -c %a /var/run/docker.sock 2>/dev/null || echo 0)
-  SOCK_MODE_DEC=$((8#$SOCK_MODE))
-  if [ "$SOCK_GID" != "0" ] && [ $((SOCK_MODE_DEC & 48)) -eq 48 ]; then
-    env_upsert DOCKER_GID "$SOCK_GID"
-    ok "docker.sock 属组 GID=$SOCK_GID 已写入 $ENV_FILE（网页端升级功能）"
-  elif [ "$SOCK_GID" = "0" ]; then
-    warn "docker.sock 属主为 root:root，容器内非 root 无法访问；网页端升级功能不可用（命令行升级不受影响）"
-  else
-    warn "docker.sock 权限为 $SOCK_MODE，属组无读写权限；网页端升级功能不可用（命令行升级不受影响）"
-  fi
-else
-  warn "未找到 /var/run/docker.sock；网页端升级功能不可用（命令行升级不受影响）"
-fi
-
+# ---------- 升级模式 ----------
+# 升级只允许由 NAS 宿主机上的命令行执行；网页升级和 Docker socket 路径已关闭。
 # ---------- HTTP 辅助（curl 优先，wget 兜底） ----------
 # 用法: http_get <timeout秒> <url> [可选代理URL]
 http_get() {
@@ -162,6 +520,58 @@ port_listening() { # $1=port
   fi
 }
 
+# 读取本机 listener 地址；ss/netstat 不可用时返回失败，安全校验不能猜测。
+listener_addresses() { # $1=port
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltn 2>/dev/null | awk -v p="$1" '$4 ~ (":" p "$" ) {print $4}'
+  elif command -v netstat >/dev/null 2>&1; then
+    netstat -ltn 2>/dev/null | awk -v p="$1" '$4 ~ (":" p "$" ) {print $4}'
+  else
+    return 1
+  fi
+}
+
+# Caddy admin API 中的实际 HTTP listener（按行输出，如 :443 或 127.0.0.1:13080）。
+caddy_listeners() {
+  local config
+  config=$(docker exec dsh-caddy wget -qO- http://127.0.0.1:2019/config/ 2>/dev/null) || return 1
+  printf '%s' "$config" \
+    | grep -oE '"listen"[[:space:]]*:[[:space:]]*\[[^]]*\]' \
+    | sed -E 's/.*\[(.*)\].*/\1/' \
+    | tr ',' '\n' \
+    | tr -d '"[:space:]'
+}
+
+listener_tool_available() {
+  command -v ss >/dev/null 2>&1 || command -v netstat >/dev/null 2>&1
+}
+
+caddy_container_owns_port() { # $1=port；admin API 不可读时保守返回失败
+  local port="$1"
+  [ -n "${CADDY_CURRENT_LISTENERS:-}" ] \
+    && printf '%s\n' "$CADDY_CURRENT_LISTENERS" | grep -qE "(^|:)${port}$"
+}
+
+# 检查 Caddy admin API 返回的 listener 是否与入口模式完全一致。
+caddy_listener_set_ok() {
+  case "$ENTRY_MODE" in
+    "$MODE_FRONT_PROXY")
+      printf '%s\n' "$CADDY_LISTENERS" | grep -Fxq "127.0.0.1:$INTERNAL_PORT" \
+        && [ "$(printf '%s\n' "$CADDY_LISTENERS" | sort -u | wc -l)" -eq 1 ]
+      ;;
+    "$MODE_DIRECT_80_443")
+      printf '%s\n' "$CADDY_LISTENERS" | grep -Fxq ':80' \
+        && printf '%s\n' "$CADDY_LISTENERS" | grep -Fxq ':443' \
+        && [ "$(printf '%s\n' "$CADDY_LISTENERS" | sort -u | wc -l)" -eq 2 ]
+      ;;
+    "$MODE_DIRECT_443_ONLY")
+      printf '%s\n' "$CADDY_LISTENERS" | grep -Fxq ':443' \
+        && [ "$(printf '%s\n' "$CADDY_LISTENERS" | sort -u | wc -l)" -eq 1 ]
+      ;;
+    *) return 1 ;;
+  esac
+}
+
 # ---------- 配置向导：域名 / 邮箱 / 密钥 / 鉴权密码 自动写入 ----------
 backup_file() { # $1=path
   [ -f "$1" ] && cp "$1" "$1.bak"
@@ -180,13 +590,6 @@ authelia_hash() { # $1=password；成功输出哈希到 stdout
   printf '%s' "$out" | grep -o '\$argon2id\$[^[:space:]]*' | head -n 1
 }
 
-# Caddy bcrypt 密码哈希（需要 docker 拉取 caddy 镜像）
-caddy_hash() { # $1=password；成功输出哈希到 stdout
-  local out
-  out=$(docker run --rm caddy caddy hash-password --plaintext "$1" 2>/dev/null) || return 1
-  printf '%s' "$out" | grep -o '\$2[aby]\$[^[:space:]]*' | head -n 1
-}
-
 # 读取一行输入（IFS 含 \r：剥离 Windows 管道可能注入的回车符，保留内部空格）
 read_line() { # $1=变量名
   IFS=$'\t\n\r' read -r "$1"
@@ -202,22 +605,16 @@ run_setup_wizard() {
   # 已配置且未强制 --setup → 跳过
   if [ "$SETUP_FORCE" -eq 0 ]; then
     local need=0
-    if grep -qE '^\s*:[0-9]+\s*\{' "$CADDYFILE"; then
-      # 备选方案（Basic Auth）：只需 Caddyfile 就绪
-      grep -qE '__CADDY_HASH__' "$CADDYFILE" && need=1
-      grep -vE '^\s*#' "$CADDYFILE" | grep -q 'example\.com' && need=1
-    else
-      # 主方案（Authelia）：密钥、密码、域名都要就绪
-      grep -q 'CHANGE_ME_' "$AUTHELIA_CONF" && need=1
-      grep -q 'p=8\$\.\.\.' "$USERS_DB" && need=1
-      grep -vE '^\s*#' "$CADDYFILE" | grep -q 'example\.com' && need=1
-      grep -vE '^\s*#' "$AUTHELIA_CONF" | grep -q 'example\.com' && need=1
-      # 盲点修复：模板 Caddyfile 的 example.com 全在注释里，活跃检查发现不了。
-      # 若 Caddyfile 活跃配置行太少（无任何站点块/http_port），视为未配置。
-      # 注意：grep -c 无匹配时既输出 0 又返回 1，不能写成 $(... || echo 0)（会得到两行）。
-      active_lines=$(grep -cE '^\s*[^#[:space:]]' "$CADDYFILE" 2>/dev/null) || active_lines=0
-      [ "$active_lines" -lt 3 ] && need=1
-    fi
+    # 主方案（Authelia）：密钥、密码、域名都要就绪。
+    # Basic Auth 已删除；旧的 :PORT 配置在后面的配置检查中明确拒绝。
+    grep -q 'CHANGE_ME_' "$AUTHELIA_CONF" && need=1
+    grep -q 'p=8\$\.\.\.' "$USERS_DB" && need=1
+    grep -vE '^\s*#' "$CADDYFILE" | grep -q 'example\.com' && need=1
+    grep -vE '^\s*#' "$AUTHELIA_CONF" | grep -q 'example\.com' && need=1
+    # 模板 Caddyfile 的 example.com 全在注释里，活跃检查发现不了；
+    # 若 Caddyfile 活跃配置行太少（无任何站点块/http_port），视为未配置。
+    active_lines=$(grep -cE '^\s*[^#[:space:]]' "$CADDYFILE" 2>/dev/null) || active_lines=0
+    [ "$active_lines" -lt 3 ] && need=1
     if [ "$need" -eq 0 ]; then
       ok "配置已就绪，跳过向导（用 --setup 可强制重跑）"
       return 0
@@ -245,15 +642,9 @@ run_setup_wizard() {
     ok "代理已写入 $ENV_FILE：DSH_PROXY=$PROXY"
   fi
 
-  echo "  选择访问方案："
-  echo "    1) 域名 + Authelia 双因素（推荐；需要域名，如 example.com）"
-  echo "    2) 纯内网 IP + Basic Auth（不需要域名）"
-  printf "  请输入 1 或 2 [1]: "
-  read_line MODE_SEL
-  [ -z "$MODE_SEL" ] && MODE_SEL=1
-
-  if [ "$MODE_SEL" = "1" ]; then
-    # ---------- 方案 1：域名 + Authelia ----------
+  echo "  访问方案：域名 + Authelia 双因素（需要可用域名，如 example.com）"
+  MODE_SEL=1
+  # ---------- 域名 + Authelia ----------
     printf "  输入根域（如 example.com，不要带 http://）: "
     read_line ROOT
     ROOT="${ROOT#http://}"; ROOT="${ROOT#https://}"
@@ -267,33 +658,37 @@ run_setup_wizard() {
       ""|*" "*) fail "无效邮箱: $EMAIL"; return 1 ;;
     esac
 
-    # 公网入口方式：决定 Caddy 是直连公网（443-only）还是由 lucky/CF 反代终结 TLS
+    # 公网入口方式：Caddy 直连 443-only、直连 80/443，或由 lucky/CF 反代终结 TLS。
     echo "  选择公网入口方式："
-    echo "    1) Caddy 直连公网（DDNS 把域名解析到 NAS，IPv6/IPv4 放行 443）"
-    echo "    2) lucky / CF Tunnel 等反代入口（前置反代终结 TLS，Caddy 只监听内部端口）"
-    printf "  请输入 1 或 2 [1]: "
+    echo "    1) Caddy 直连 443-only（仅需空闲 443；不提供 HTTP 自动跳转）"
+    echo "    2) Caddy 直连 80/443（80 用于 HTTP→HTTPS 跳转/ACME HTTP-01）"
+    echo "    3) lucky / CF Tunnel 等前置反代（公网 TLS 终结，Caddy 只监听内部端口）"
+    printf "  请输入 1、2 或 3 [1]: "
     read_line ENTRY_SEL
     [ -z "$ENTRY_SEL" ] && ENTRY_SEL=1
-    if [ "$ENTRY_SEL" = "2" ]; then
-      ENTRY_MODE=2
-      # 公网 HTTPS 端口 = lucky/CF 反代监听的端口（浏览器访问时带 :端口）
-      printf "  公网 HTTPS 端口（lucky/CF 监听端口，浏览器访问用）[443]: "
-      read_line NEW_PUBLIC_PORT
-      if [ -n "$NEW_PUBLIC_PORT" ]; then
-        case "$NEW_PUBLIC_PORT" in
-          *[!0-9]*) fail "无效端口: $NEW_PUBLIC_PORT（应为 1-65535 的数字）"; return 1 ;;
-        esac
-        if [ "$NEW_PUBLIC_PORT" -lt 1 ] || [ "$NEW_PUBLIC_PORT" -gt 65535 ]; then
-          fail "端口超出范围: $NEW_PUBLIC_PORT（应为 1-65535）"; return 1
+    case "$ENTRY_SEL" in
+      1) ENTRY_MODE="$MODE_DIRECT_443_ONLY" ;;
+      2) ENTRY_MODE="$MODE_DIRECT_80_443" ;;
+      3)
+        ENTRY_MODE="$MODE_FRONT_PROXY"
+        # 公网 HTTPS 端口 = lucky/CF 反代监听的端口（浏览器访问时带 :端口）
+        printf "  公网 HTTPS 端口（lucky/CF 监听端口，浏览器访问用）[443]: "
+        read_line NEW_PUBLIC_PORT
+        if [ -n "$NEW_PUBLIC_PORT" ]; then
+          case "$NEW_PUBLIC_PORT" in
+            *[!0-9]*) fail "无效端口: $NEW_PUBLIC_PORT（应为 1-65535 的数字）"; return 1 ;;
+          esac
+          if [ "$NEW_PUBLIC_PORT" -lt 1 ] || [ "$NEW_PUBLIC_PORT" -gt 65535 ]; then
+            fail "端口超出范围: $NEW_PUBLIC_PORT（应为 1-65535）"; return 1
+          fi
+          PUBLIC_PORT="$NEW_PUBLIC_PORT"
         fi
-        PUBLIC_PORT="$NEW_PUBLIC_PORT"
-      fi
-      if [ "$PUBLIC_PORT" != "443" ]; then
-        echo "  ${C_Y}  公网访问将是 https://dsh.$ROOT:$PUBLIC_PORT / https://auth.$ROOT:$PUBLIC_PORT（记得 IPv6 放行 $PUBLIC_PORT）${C_0}"
-      fi
-    elif [ "$ENTRY_SEL" != "1" ]; then
-      fail "无效入口方式: $ENTRY_SEL（应为 1 或 2）"; return 1
-    fi
+        if [ "$PUBLIC_PORT" != "443" ]; then
+          echo "  ${C_Y}  公网访问将是 https://dsh.$ROOT:$PUBLIC_PORT / https://auth.$ROOT:$PUBLIC_PORT（记得防火墙放行 $PUBLIC_PORT）${C_0}"
+        fi
+        ;;
+      *) fail "无效入口方式: $ENTRY_SEL（应为 1、2 或 3）"; return 1 ;;
+    esac
 
     # 修改 authelia 配置前先备份（与 usage 承诺的 .bak 一致）
     backup_file "$AUTHELIA_CONF"
@@ -325,7 +720,7 @@ run_setup_wizard() {
     fi
     # 公网端口：先清掉 URL 里历史残留的 :端口，再按本次入口模式统一追加（幂等，支持换端口）
     sed -i -E "s#(auth\.$ROOT|dsh\.$ROOT):[0-9]+#\1#g" "$AUTHELIA_CONF"
-    if [ "$ENTRY_MODE" -eq 2 ] && [ "$PUBLIC_PORT" != "443" ]; then
+    if [ "$ENTRY_MODE" = "$MODE_FRONT_PROXY" ] && [ "$PUBLIC_PORT" != "443" ]; then
       sed -i "s#https://auth\.$ROOT'#https://auth.$ROOT:$PUBLIC_PORT'#g" "$AUTHELIA_CONF"
       sed -i "s#https://dsh\.$ROOT'#https://dsh.$ROOT:$PUBLIC_PORT'#g" "$AUTHELIA_CONF"
     fi
@@ -362,13 +757,14 @@ run_setup_wizard() {
       fi
     fi
 
-    # 生成 Caddyfile（主方案，按入口方式分两种形态）
+    # 生成 Caddyfile（主方案，按三种入口模式生成）
     backup_file "$CADDYFILE"
-    if [ "$ENTRY_MODE" -eq 2 ]; then
+    if [ "$ENTRY_MODE" = "$MODE_FRONT_PROXY" ]; then
       # lucky / CF Tunnel 反代入口：TLS 由前置终结，Caddy 内部 http（$INTERNAL_PORT）
       # authelia_url 用公网 URL（含 lucky 监听端口，如 https://auth.example.com:16666）
       AUTH_URL=$(pub_url "auth.$ROOT")
       cat > "$CADDYFILE" <<EOF
+# dsh-nas-entry-mode: front-proxy
 # 由 deploy.sh 配置向导生成（模式：lucky/CF 反代入口，Caddy 内部 http）（原始文件备份于同目录 .bak）
 {
     auto_https off
@@ -406,11 +802,47 @@ EOF
       echo "  ${C_Y}  提示: 在 lucky/CF 中把 dsh.$ROOT 和 auth.$ROOT 都转发到 http://127.0.0.1:$INTERNAL_PORT，并设 X-Forwarded-Proto: https；"
       echo "  Caddy 内部端口已只绑回环（default_bind 127.0.0.1），局域网无法绕过 lucky 直连；若 lucky/CF 运行在其它机器，需把 default_bind 改成 0.0.0.0 或 NAS 局域网 IP${C_0}"
     else
-      # Caddy 直连公网：443-only，证书走 TLS-ALPN-01（不依赖 80，NAS 系统占用 80 无碍）
-      cat > "$CADDYFILE" <<EOF
+      if [ "$ENTRY_MODE" = "$MODE_DIRECT_80_443" ]; then
+        # Caddy 直连公网：80/443，保留 HTTP→HTTPS 跳转并允许 ACME HTTP-01。
+        cat > "$CADDYFILE" <<EOF
+# dsh-nas-entry-mode: direct-80-443
+# 由 deploy.sh 配置向导生成（模式：Caddy 直连公网，80/443）（原始文件备份于同目录 .bak）
+{
+    email $EMAIL
+}
+
+https://auth.$ROOT {
+    reverse_proxy 127.0.0.1:9091
+}
+
+https://dsh.$ROOT {
+    forward_auth 127.0.0.1:9091 {
+        uri /api/authz/forward-auth?authelia_url=https://auth.$ROOT
+        copy_headers Remote-User Remote-Groups Remote-Email Remote-Name
+        @authfail {
+            status 401
+        }
+        handle_response @authfail {
+            redir {http.response.header.Location} 302
+        }
+    }
+    reverse_proxy 127.0.0.1:3080 {
+        header_up Host 127.0.0.1:3080
+        header_up Origin http://127.0.0.1:3080
+    }
+}
+EOF
+        ok "已生成 Caddyfile（直连模式，80/443 + HTTP→HTTPS，域名 $ROOT）"
+        echo "  ${C_Y}  提示: 确保域名解析到 NAS，防火墙放行 80 和 443${C_0}"
+      else
+        # Caddy 直连公网：443-only，证书默认使用 ACME TLS-ALPN-01（不依赖 80，
+        # NAS 系统占用 80 无碍）。disable_redirects 只关闭自动 HTTP 跳转，保留证书自动化。
+        cat > "$CADDYFILE" <<EOF
+# dsh-nas-entry-mode: direct-443-only
 # 由 deploy.sh 配置向导生成（模式：Caddy 直连公网，443-only）（原始文件备份于同目录 .bak）
 {
     email $EMAIL
+    auto_https disable_redirects
 }
 
 https://auth.$ROOT {
@@ -435,44 +867,11 @@ https://dsh.$ROOT {
     }
 }
 EOF
-      ok "已生成 Caddyfile（直连模式，443-only + TLS-ALPN-01，域名 $ROOT）"
-      echo "  ${C_Y}  提示: 确保域名解析到 NAS（DDNS/lucky），防火墙放行 443${C_0}"
+        ok "已生成 Caddyfile（直连模式，443-only + TLS-ALPN-01，域名 $ROOT）"
+        echo "  ${C_Y}  提示: 确保域名解析到 NAS（DDNS/lucky），防火墙放行 443${C_0}"
+      fi
     fi
 
-  elif [ "$MODE_SEL" = "2" ]; then
-    # ---------- 方案 2：内网 + Basic Auth ----------
-    printf "  输入 Basic Auth 密码（访问 Web UI 用，不回显）: "
-    read_secret BPW1
-    printf "  再次输入确认: "
-    read_secret BPW2
-    if [ -z "$BPW1" ]; then fail "密码不能为空"; return 1; fi
-    if [ "$BPW1" != "$BPW2" ]; then fail "两次密码不一致"; return 1; fi
-    echo "  正在生成 bcrypt 哈希（首次需拉取 caddy 镜像，请稍候）..."
-    CADDY_HASH=$(caddy_hash "$BPW1")
-    if [ -z "$CADDY_HASH" ]; then
-      fail "密码哈希生成失败（docker 或网络问题）；请手动运行: docker run --rm caddy caddy hash-password --plaintext '你的密码' 后填入 Caddyfile"
-      return 1
-    fi
-    backup_file "$CADDYFILE"
-    cat > "$CADDYFILE" <<EOF
-# 由 deploy.sh 配置向导生成（原始文件备份于同目录 .bak）
-:$ALT_PORT {
-    basic_auth {
-        admin __CADDY_HASH__
-    }
-    reverse_proxy 127.0.0.1:3080 {
-        header_up Host 127.0.0.1:3080
-        header_up Origin http://127.0.0.1:3080
-    }
-}
-EOF
-    sed -i "s|__CADDY_HASH__|$CADDY_HASH|" "$CADDYFILE"
-    ok "已生成 Caddyfile（备选方案，:$ALT_PORT + Basic Auth）"
-    echo "  ${C_Y}  提示: 备选方案不会启动 authelia 容器（compose profile 控制），无需手动移除${C_0}"
-  else
-    fail "无效选择: $MODE_SEL（应为 1 或 2）"
-    return 1
-  fi
   echo "  ${C_G}配置向导完成，继续检查...${C_0}"
 }
 
@@ -511,7 +910,7 @@ section "3. 配置向导"
 if [ "$UPGRADE_MODE" -eq 1 ]; then
   ok "升级模式：跳过配置向导（Caddy/Authelia 配置保持不变）"
   backup_upgrade_configs || {
-    fail "无法创建升级前配置快照；为保护 Caddy/Authelia，停止升级"
+    fail "无法创建升级前配置快照；为保护版本和 Caddy/Authelia，停止升级"
     exit 1
   }
   # --latest：从 npm registry 取 @deepseek-ai/dsh 最新版写入版本文件（与网页端升级同一数据源）
@@ -522,12 +921,19 @@ if [ "$UPGRADE_MODE" -eq 1 ]; then
     LATEST_V=$(printf '%s' "$LATEST_JSON" | grep -o '"version": *"[^"]*"' | head -n 1 | cut -d'"' -f4)
     if ! [[ "$LATEST_V" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$ ]]; then
       fail "获取 npm 最新版本失败（registry 直连与代理均不可达，或返回异常）"
-      echo "  可手动改 Dockerfile 的 DSH_VERSION 与 docker-compose.yml 的 build arg 后，不带 --latest 重跑"
+      echo "  可手动改 Dockerfile 的 DSH_VERSION 后，不带 --latest 重跑"
       exit 1
     fi
     OLD_V=$(sed -n 's/^ARG DSH_VERSION=//p' "$SCRIPT_DIR/Dockerfile" | head -n 1)
-    sed -i -E "s/^ARG DSH_VERSION=.*/ARG DSH_VERSION=$LATEST_V/" "$SCRIPT_DIR/Dockerfile"
-    sed -i -E "s#^ *DSH_VERSION:.*#        DSH_VERSION: \"$LATEST_V\"#" "$SCRIPT_DIR/docker-compose.yml"
+    if [ -z "$OLD_V" ]; then
+      fail "Dockerfile 中缺少唯一的 DSH_VERSION 版本来源"
+      exit 1
+    fi
+    if ! update_dsh_version_atomic "$LATEST_V"; then
+      fail "无法原子更新 Dockerfile 的 DSH_VERSION"
+      restore_upgrade_version
+      exit 1
+    fi
     if [ "$OLD_V" = "$LATEST_V" ]; then
       ok "npm 最新版 $LATEST_V 与当前一致（构建走缓存）"
     else
@@ -538,36 +944,84 @@ else
   run_setup_wizard
 fi
 
-# 方案检测（向导可能已生成 Caddyfile，需在配置检查前确定模式）
-if grep -qE '^\s*:[0-9]+\s*\{' "$CADDYFILE"; then
-  ALT_MODE=1
-  ALT_PORT=$(grep -oE '^\s*:[0-9]+' "$CADDYFILE" | head -n 1 | tr -dc '0-9')
-fi
-# 入口模式检测：Caddyfile 含 http:// 站点块 = 反代入口（内部 http）；否则 = 直连
-if grep -qE '^http://' "$CADDYFILE"; then ENTRY_MODE=2; fi
-# 反代入口模式下从 Caddyfile 的 authelia_url 还原公网端口（向导跳过时结果摘要才有正确 URL）
-if [ "$ENTRY_MODE" -eq 2 ]; then
-  CADDY_PUBLIC_PORT=$(grep -oE 'authelia_url=https?://[^[:space:]{}]+' "$CADDYFILE" | head -n 1 | grep -oE ':[0-9]+$' | tr -d ':')
-  [ -n "$CADDY_PUBLIC_PORT" ] && PUBLIC_PORT="$CADDY_PUBLIC_PORT"
+# Basic Auth 已删除：过滤注释后，发现旧的裸端口站点或 basic_auth 指令时直接要求迁移。
+ACTIVE_CADDY=$(sed '/^[[:space:]]*#/d' "$CADDYFILE")
+if printf '%s\n' "$ACTIVE_CADDY" | grep -qE '(^|[[:space:]])(:[0-9]+|basic_auth|basicauth)([[:space:]]|\{|$)'; then
+  fail "检测到已删除的 Basic Auth/裸端口 Caddy 配置（$CADDYFILE）；请先保留备份，再运行 ./deploy.sh --setup 迁移到域名 + Authelia 或前置反代/Tunnel。旧 Basic Auth 密码不会自动迁移。"
+  exit 1
 fi
 
-# 主方案（Authelia）启动 authelia 容器；备选方案（Basic Auth）不启动
-if [ "$ALT_MODE" -eq 1 ]; then
-  PROFILE_ARGS=""
+# 入口模式通过向导写入的显式标记恢复；无标记的旧手工配置只做兼容性探测，
+# 探测失败时拒绝继续，避免错误检查 443/13080 和输出错误访问地址。
+MODE_MARKER=$(sed -n 's/^# dsh-nas-entry-mode: //p' "$CADDYFILE" | head -n 1)
+if [ -n "$MODE_MARKER" ]; then
+  case "$MODE_MARKER" in
+    "$MODE_DIRECT_80_443"|"$MODE_DIRECT_443_ONLY"|"$MODE_FRONT_PROXY") ENTRY_MODE="$MODE_MARKER" ;;
+    *) fail "Caddyfile 的入口模式标记无效: $MODE_MARKER"; exit 1 ;;
+  esac
 else
-  PROFILE_ARGS="--profile auth"
+  if printf '%s\n' "$ACTIVE_CADDY" | grep -qE '(^|[[:space:]])http://'; then
+    ENTRY_MODE="$MODE_FRONT_PROXY"
+  elif printf '%s\n' "$ACTIVE_CADDY" | grep -qE '(^|[[:space:]])https://'; then
+    ENTRY_MODE="$MODE_DIRECT_443_ONLY"
+  else
+    fail "无法确定 Caddy 入口模式；请运行 ./deploy.sh --setup 重新生成带模式标记的配置"
+    exit 1
+  fi
+  warn "Caddyfile 缺少入口模式标记，已根据活跃站点兼容探测为 $ENTRY_MODE；这是兼容回退，建议运行 ./deploy.sh --setup 固化模式"
+fi
+
+# 主方案始终启动 Authelia；Basic Auth 已删除。
+PROFILE_ARGS="--profile auth"
+
+# Authelia 配置必须先通过官方镜像校验，避免错误配置进入 Compose。
+validate_authelia_config() {
+  if ! docker run --rm --entrypoint authelia \
+       -v "$SCRIPT_DIR/authelia:/config:ro" \
+       -v "$SCRIPT_DIR/authelia/data:/config/data:ro" \
+       authelia/authelia:4.39 --config /config/configuration.yml config validate >/dev/null 2>&1; then
+    fail "Authelia 配置校验失败；请运行 docker run --rm --entrypoint authelia -v \"$SCRIPT_DIR/authelia:/config:ro\" -v \"$SCRIPT_DIR/authelia/data:/config/data:ro\" authelia/authelia:4.39 --config /config/configuration.yml config validate 查看详情"
+    return 1
+  fi
+  ok "Authelia 4.39 配置校验通过"
+}
+validate_compose_config() {
+  if ! $COMPOSE config --quiet >/dev/null 2>&1; then
+    fail "$COMPOSE config 校验失败；请修复 Compose 文件或变量后重试"
+    return 1
+  fi
+  ok "Docker Compose 配置校验通过"
+}
+validate_caddy_config() {
+  if ! docker run --rm -i caddy:2-alpine caddy validate --config - --adapter caddyfile <"$CADDYFILE" >/dev/null 2>&1; then
+    fail "Caddyfile 语法校验失败；请运行 docker run --rm -i caddy:2-alpine caddy validate --config - --adapter caddyfile < \"$CADDYFILE\" 查看详情"
+    return 1
+  fi
+  ok "Caddyfile 语法校验通过"
+}
+if [ "$UPGRADE_MODE" -eq 0 ]; then
+  validate_authelia_config || exit 1
+fi
+if [ -n "$COMPOSE" ]; then
+  validate_compose_config || exit 1
+fi
+validate_caddy_config || exit 1
+
+# 反代入口模式下从 authelia_url 还原公网端口；缺失或非法时不静默回退。
+if [ "$ENTRY_MODE" = "$MODE_FRONT_PROXY" ]; then
+  CADDY_PUBLIC_PORT=$(printf '%s\n' "$ACTIVE_CADDY" | grep -oE 'authelia_url=https?://[^[:space:]{}]+' | head -n 1 | sed -n 's#.*:\([0-9][0-9]*\)$#\1#p')
+  if [ -n "$CADDY_PUBLIC_PORT" ]; then
+    if [ "$CADDY_PUBLIC_PORT" -lt 1 ] || [ "$CADDY_PUBLIC_PORT" -gt 65535 ]; then
+      fail "Caddyfile 的公网端口无效: $CADDY_PUBLIC_PORT"; exit 1
+    fi
+    PUBLIC_PORT="$CADDY_PUBLIC_PORT"
+  else
+    warn "反代 Caddyfile 未在 authelia_url 中声明公网端口，按 443 处理；请确认前置代理实际监听 443"
+  fi
 fi
 
 # ---------- 配置占位符 ----------
 section "4. 配置检查（密钥 / 密码 / 域名）"
-if [ "$ALT_MODE" -eq 1 ]; then
-  ok "备选方案模式（Basic Auth）：跳过 Authelia 密钥/密码检查"
-  if grep -vE '^\s*#' "$CADDYFILE" | grep -q 'example\.com'; then
-    warn "Caddyfile 活跃配置中仍有 example.com（可忽略或清理）"
-  else
-    ok "域名占位符已替换"
-  fi
-else
   if grep -q 'CHANGE_ME_' "$AUTHELIA_CONF"; then
     fail "authelia/configuration.yml 仍有 CHANGE_ME_* 占位密钥（用 openssl rand -hex 32 生成后替换）"
   else
@@ -581,11 +1035,10 @@ else
   # 只检查活跃配置（过滤注释行）；Caddyfile 全局 email 也会被捕获，一并提示
   if grep -vE '^\s*#' "$CADDYFILE" | grep -q 'example\.com' \
      || grep -vE '^\s*#' "$AUTHELIA_CONF" | grep -q 'example\.com'; then
-    warn "活跃配置中仍有 example.com（域名或证书邮箱）；内网 Basic Auth 备选方案可忽略"
+    warn "活跃配置中仍有 example.com（域名或证书邮箱）"
   else
     ok "域名占位符已替换"
   fi
-fi
 
 # ---------- 数据目录权限 ----------
 section "5. 数据目录权限（容器内以 UID 1000 运行）"
@@ -600,31 +1053,99 @@ check_dir_perm() { # $1=path $2=用途说明
   if [ ! -d "$dir" ]; then
     if mkdir -p "$dir" 2>/dev/null; then
       if chown_dir "$dir" 2>/dev/null; then ok "已创建 $dir 并 chown 1000:1000（$label）"
-      else warn "已创建 $dir 但未能 chown；请手动: sudo chown -R 1000:1000 $dir"; fi
+      else fail "已创建 $dir 但无法 chown 1000:1000（$label）；请手动修复权限"; fi
     else
-      warn "无法创建 $dir，请手动创建并 chown 1000:1000"
+      fail "无法创建 $dir（$label）；请手动创建并确保 UID 1000 可写"
     fi
   else
     OWNER=$(stat -c %u "$dir" 2>/dev/null || echo "?")
     if [ "$OWNER" = "1000" ]; then
       ok "$dir 属主 = 1000（$label）"
     elif [ "$OWNER" = "?" ]; then
-      warn "无法读取 $dir 属主；请确认: sudo chown -R 1000:1000 $dir"
+      fail "无法读取 $dir 属主（$label）；请确认 NAS 支持 GNU stat 并手动检查权限"
     elif chown_dir "$dir" 2>/dev/null; then
       ok "已 chown -R 1000:1000（$label，原属主 $OWNER）"
     else
-      warn "$dir 属主为 $OWNER（应为 1000）；请手动: sudo chown -R 1000:1000 $dir"
+      fail "$dir 属主为 $OWNER 且无法修复（应为 1000，$label）"
     fi
+  fi
+}
+check_container_dir_perm() { # $1=path $2=用途说明
+  local dir="$1" label="$2"
+  if [ ! -d "$dir" ]; then
+    if mkdir -p "$dir" 2>/dev/null; then
+      ok "已创建 $dir（$label）"
+    else
+      fail "无法创建 $dir（$label）；请手动创建并确保容器可写"
+    fi
+  elif [ -L "$dir" ]; then
+    fail "$dir 不能是符号链接（$label）"
+  else
+    ok "$dir 已存在（$label；由对应容器用户写入）"
+  fi
+}
+write_test_as_container_root() { # $1=directory $2=用途说明 $3=image
+  local dir="$1" label="$2" image="$3" probe_name=".dsh-nas-root-write-test.$$" probe="$1/$probe_name"
+  if [ "$(id -u)" -eq 0 ] \
+     && sh -c 'p="$1"; printf "ok\\n" >"$p" && rm -f "$p"' sh "$probe" >/dev/null 2>&1 \
+     && [ ! -e "$probe" ]; then
+    ok "$dir 实际写入和删除测试通过（$label，宿主 root/容器 root）"
+  elif command -v docker >/dev/null 2>&1 \
+       && docker run --rm --entrypoint sh -v "$dir:/probe" "$image" \
+            -c 'p="/probe/$1"; printf "ok\\n" >"$p" && rm -f "$p"' sh "$probe_name" >/dev/null 2>&1 \
+       && [ ! -e "$probe" ]; then
+    ok "$dir 实际写入和删除测试通过（$label，容器 root）"
+  else
+    rm -f "$probe" 2>/dev/null || true
+    fail "$dir 实际写入测试失败（$label）；请确认对应容器用户可以创建、写入和删除文件"
+  fi
+}
+write_test_as_uid1000() { # $1=directory $2=用途说明
+  local dir="$1" label="$2" probe_name=".dsh-nas-write-test.$$" probe="$1/$probe_name"
+  # 首次部署时镜像尚未构建，优先用真实 UID 1000 做宿主文件系统测试。
+  if [ "$(id -u)" -eq 1000 ] \
+     && sh -c 'p="$1"; printf "ok\\n" >"$p" && rm -f "$p"' sh "$probe" >/dev/null 2>&1 \
+     && [ ! -e "$probe" ]; then
+    ok "$dir 实际写入和删除测试通过（$label，当前 UID 1000）"
+  elif [ "$(id -u)" -eq 0 ] && command -v setpriv >/dev/null 2>&1 \
+       && setpriv --reuid=1000 --regid=1000 --init-groups \
+            sh -c 'p="$1"; printf "ok\\n" >"$p" && rm -f "$p"' sh "$probe" >/dev/null 2>&1 \
+       && [ ! -e "$probe" ]; then
+    ok "$dir 实际写入和删除测试通过（$label，宿主 UID 1000）"
+  elif command -v docker >/dev/null 2>&1 && docker image inspect dsh:local >/dev/null 2>&1 \
+       && docker run --rm --entrypoint node -v "$dir:/probe" dsh:local \
+            -e 'const fs=require("node:fs"); const p="/probe/"+process.argv[1]; fs.writeFileSync(p,"ok\\n"); fs.unlinkSync(p)' "$probe_name" >/dev/null 2>&1 \
+       && [ ! -e "$probe" ]; then
+    ok "$dir 实际写入和删除测试通过（$label，dsh node UID 1000）"
+  else
+    rm -f "$probe" 2>/dev/null || true
+    fail "$dir 实际写入测试失败（$label）；请确认本地文件系统允许 UID 1000 创建、写入和删除文件"
   fi
 }
 check_dir_perm "$DATA_DIR" "DSH 数据目录（配置/凭据/会话/存储）"
 check_dir_perm "$WORKSPACE_DIR" "工作区目录（Web 目录选择器新建落点）"
 check_dir_perm "$DATA_DIR/profiles" "插件 profile 目录（node 用户必须可写）"
+check_dir_perm "$DATA_DIR/profiles/node_modules" "插件 node_modules 目录（node 用户必须可写）"
+check_container_dir_perm "$SCRIPT_DIR/caddy/data" "Caddy 证书和运行数据"
+check_container_dir_perm "$SCRIPT_DIR/caddy/config" "Caddy 配置状态"
+check_container_dir_perm "$SCRIPT_DIR/authelia/data" "Authelia SQLite 和通知文件"
+if [ "$FAIL" -eq 0 ]; then
+  write_test_as_uid1000 "$DATA_DIR" "DSH 数据目录"
+  write_test_as_uid1000 "$WORKSPACE_DIR" "工作区目录"
+  write_test_as_uid1000 "$DATA_DIR/profiles" "插件 profile 目录"
+  write_test_as_uid1000 "$DATA_DIR/profiles/node_modules" "插件 node_modules 目录"
+  write_test_as_container_root "$SCRIPT_DIR/caddy/data" "Caddy 数据目录" caddy:2-alpine
+  write_test_as_container_root "$SCRIPT_DIR/caddy/config" "Caddy 配置目录" caddy:2-alpine
+  write_test_as_container_root "$SCRIPT_DIR/authelia/data" "Authelia 数据目录" authelia/authelia:4.39
+fi
 
 # ---------- 端口与代理 ----------
 section "6. 端口与代理检查"
-# 本项目容器是否已在运行（升级场景：端口占用不判为冲突）
-RUNNING=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -cE '^(dsh|authelia|dsh-caddy)$' || true)
+# 只对实际持有目标端口的同名服务容器跳过冲突检查；不能因任一旧容器运行
+# 就跳过其它服务的端口检查。
+container_running() {
+  docker ps --format '{{.Names}}' 2>/dev/null | grep -Fxq "$1"
+}
 
 # 代理监听检测：从 $PROXY 解析目标（本机才检测监听，远程代理只测连通性）
 PROXY_HOSTPORT="${PROXY#http://}"; PROXY_HOSTPORT="${PROXY_HOSTPORT#https://}"
@@ -651,57 +1172,78 @@ else
   warn "经代理 $PROXY 访问 api.deepseek.com 失败（代理可能未就绪，部署可继续但模型请求会失败）"
 fi
 
-if [ "$RUNNING" -gt 0 ]; then
-  ok "检测到已有容器运行，跳过端口冲突检查（升级场景）"
-else
-  if port_listening 3080; then
-    fail "宿主 3080 端口已被占用（host 网络下 dsh 无法绑定）；请停掉占用进程"
+CADDY_CURRENT_LISTENERS=""
+if container_running dsh-caddy; then
+  CADDY_CURRENT_LISTENERS=$(caddy_listeners 2>/dev/null || true)
+fi
+
+if ! listener_tool_available; then
+  fail "无法读取宿主 listener 地址（需要 ss 或 netstat）；拒绝继续部署"
+elif [ -n "$(listener_addresses 3080 2>/dev/null || true)" ]; then
+  DSH_CURRENT_LISTENERS=$(listener_addresses 3080 2>/dev/null || true)
+  if container_running dsh \
+     && printf '%s\n' "$DSH_CURRENT_LISTENERS" | grep -Fxq '127.0.0.1:3080' \
+     && [ "$(printf '%s\n' "$DSH_CURRENT_LISTENERS" | sort -u | wc -l)" -eq 1 ]; then
+    ok "dsh 容器已运行，确认仅占用 127.0.0.1:3080"
+  elif container_running dsh; then
+    fail "现有 dsh listener 不符合回环安全预期（实际：$(printf '%s ' "$DSH_CURRENT_LISTENERS")）"
   else
-    ok "dsh 端口 3080 空闲"
+    fail "宿主 3080 端口已被占用（实际 listener: $(printf '%s ' "$DSH_CURRENT_LISTENERS")；host 网络下 dsh 无法绑定）"
   fi
-  if [ "$ALT_MODE" -eq 1 ]; then
-    if port_listening "$ALT_PORT"; then
-      # 端口被占用：交互式让用户指定新端口
-      echo
-      echo "  ${C_Y}⚠ 备选方案端口 $ALT_PORT 已被占用。${C_0}"
-      printf "  输入新的监听端口 [1-65535]（直接回车 = 中止部署）: "
-      read -r NEW_PORT
-      NEW_PORT="${NEW_PORT%$'\r'}"   # 防御：去掉 Windows 管道/部分终端注入的回车符
-      if [ -n "$NEW_PORT" ]; then
-        if [[ "$NEW_PORT" =~ ^[0-9]+$ ]] && [ "$NEW_PORT" -ge 1 ] && [ "$NEW_PORT" -le 65535 ]; then
-          if port_listening "$NEW_PORT"; then
-            fail "端口 $NEW_PORT 也被占用，请换一个端口后重跑"
-          elif sed -i "s/^:$ALT_PORT {/:$NEW_PORT {/" "$CADDYFILE"; then
-            ok "已把 Caddyfile 监听端口改为 $NEW_PORT"
-            ALT_PORT="$NEW_PORT"
-          else
-            fail "更新 Caddyfile 失败（$CADDYFILE）"
-          fi
-        else
-          fail "无效端口: $NEW_PORT（应为 1-65535 的数字）"
-        fi
-      else
-        fail "未输入端口，中止部署；可自行修改 Caddyfile 的 :$ALT_PORT 后重跑"
-      fi
+else
+  ok "dsh 端口 3080 空闲"
+fi
+
+if [ "$ENTRY_MODE" = "$MODE_FRONT_PROXY" ]; then
+  # 反代入口（lucky/CF）：Caddy 只监听内部 $INTERNAL_PORT，公网端口由前置反代负责。
+  FRONT_LISTENERS=$(listener_addresses "$INTERNAL_PORT" 2>/dev/null || true)
+  if [ -n "$FRONT_LISTENERS" ]; then
+    if container_running dsh-caddy \
+       && printf '%s\n' "$CADDY_CURRENT_LISTENERS" | grep -Fxq "127.0.0.1:$INTERNAL_PORT" \
+       && [ "$(printf '%s\n' "$CADDY_CURRENT_LISTENERS" | sort -u | wc -l)" -eq 1 ]; then
+      ok "dsh-caddy 容器已运行，确认占用回环内部端口 127.0.0.1:$INTERNAL_PORT"
+    elif container_running dsh-caddy && [ -n "$CADDY_CURRENT_LISTENERS" ]; then
+      fail "现有 dsh-caddy listener 不符合回环内部模式（实际：$(printf '%s ' "$CADDY_CURRENT_LISTENERS")）"
+    elif container_running dsh-caddy; then
+      fail "现有 dsh-caddy 已运行但无法读取 admin API listener；拒绝假定其占用端口安全"
     else
-      ok "备选方案端口 $ALT_PORT 空闲"
+      fail "宿主 $INTERNAL_PORT 端口已被占用（实际 listener: $(printf '%s ' "$FRONT_LISTENERS")；Caddy 需绑定回环内部端口）"
     fi
   else
-    if [ "$ENTRY_MODE" -eq 2 ]; then
-      # 反代入口（lucky/CF）：Caddy 只监听内部 $INTERNAL_PORT，公网端口由前置反代负责
-      if port_listening "$INTERNAL_PORT"; then
-        fail "宿主 $INTERNAL_PORT 端口已被占用（Caddy 内部 http 监听需要；可用 --setup 重跑或改 deploy.sh 的 INTERNAL_PORT 后重跑）"
+    ok "Caddy 内部端口 $INTERNAL_PORT 空闲"
+  fi
+elif [ "$ENTRY_MODE" = "$MODE_DIRECT_80_443" ]; then
+  for required_port in 80 443; do
+    REQUIRED_LISTENERS=$(listener_addresses "$required_port" 2>/dev/null || true)
+    if [ -n "$REQUIRED_LISTENERS" ]; then
+      if container_running dsh-caddy && caddy_container_owns_port "$required_port"; then
+        ok "dsh-caddy 容器已运行，保留端口 $required_port；启动后仍会校验完整 80/443 listener"
+      elif container_running dsh-caddy; then
+        fail "现有 dsh-caddy 未在 admin API 中声明端口 $required_port；拒绝假定端口冲突可复用"
       else
-        ok "Caddy 内部端口 $INTERNAL_PORT 空闲"
+        fail "宿主 $required_port 端口已被占用（实际 listener: $(printf '%s ' "$REQUIRED_LISTENERS")；直连 80/443 模式需要该端口）"
       fi
     else
-      # 直连模式：443-only（TLS-ALPN-01 证书），不依赖 80——NAS 系统组件占用 80 无碍
-      if port_listening 443; then
-        fail "宿主 443 端口已被占用（Caddy 直连模式需要；请停用占用进程，或改走 lucky/CF 反代入口）"
-      else
-        ok "Caddy 端口 443 空闲（80 不检查：443-only 设计，NAS 系统占用 80 不影响）"
-      fi
+      ok "Caddy 端口 $required_port 空闲（直连 80/443 模式）"
     fi
+  done
+else
+  # 直连 443-only：不需要 80，且启动后必须确认没有 80 listener。
+  REQUIRED_LISTENERS=$(listener_addresses 443 2>/dev/null || true)
+  if [ -n "$REQUIRED_LISTENERS" ]; then
+    if container_running dsh-caddy \
+       && printf '%s\n' "$CADDY_CURRENT_LISTENERS" | grep -Fxq ':443' \
+       && [ "$(printf '%s\n' "$CADDY_CURRENT_LISTENERS" | sort -u | wc -l)" -eq 1 ]; then
+      ok "dsh-caddy 容器已运行，确认占用 443"
+    elif container_running dsh-caddy && [ -n "$CADDY_CURRENT_LISTENERS" ]; then
+      fail "现有 dsh-caddy listener 不符合 443-only 预期（实际：$(printf '%s ' "$CADDY_CURRENT_LISTENERS")）"
+    elif container_running dsh-caddy; then
+      fail "现有 dsh-caddy 已运行但无法读取 admin API listener；拒绝假定 443-only 安全"
+    else
+      fail "宿主 443 端口已被占用（实际 listener: $(printf '%s ' "$REQUIRED_LISTENERS")；Caddy 直连模式需要该端口）"
+    fi
+  else
+    ok "Caddy 端口 443 空闲（443-only 模式）"
   fi
 fi
 
@@ -716,22 +1258,36 @@ fi
 # ---------- 构建与启动 ----------
 section "7. 构建与启动"
 cd "$SCRIPT_DIR"
-if [ "$UPGRADE_MODE" -eq 1 ] && [ "$SKIP_BUILD" -eq 1 ]; then
-  fail "升级模式不能与 --skip-build 同时使用（必须重新构建 dsh 镜像）"
-  exit 1
-fi
 compose_up() {
   # --profile 是 compose 顶层 flag，必须置于子命令之前：docker compose --profile auth up -d
-  if $COMPOSE $PROFILE_ARGS up -d; then
-    UP_OK=1; ok "容器已启动"
-  else
-    fail "$COMPOSE up -d 失败；运行 $COMPOSE logs 排查（常见: Caddyfile 语法错误 / 端口绑定失败）"
+  if [ "$UPGRADE_MODE" -eq 1 ]; then
+    UPGRADE_SWITCH_ATTEMPTED=1
   fi
+  if $COMPOSE $PROFILE_ARGS up -d; then
+    UP_OK=1
+    if [ "$UPGRADE_MODE" -eq 1 ]; then
+      if upgrade_stack_changed; then
+        UPGRADE_SWITCHED=1
+      else
+        echo "  ${C_Y}升级: Compose 成功但未确认容器或镜像已切换；后续失败不会停止原栈${C_0}"
+      fi
+    fi
+    ok "容器已启动"
+    return 0
+  fi
+  fail "$COMPOSE up -d 失败；运行 $COMPOSE logs 排查（常见: Caddyfile 语法错误 / 端口绑定失败）"
+  return 1
+}
+compose_down_current() {
+  [ -n "$COMPOSE" ] || return 1
+  $COMPOSE $PROFILE_ARGS down
 }
 UP_OK=0
 if [ "$SKIP_BUILD" -eq 1 ]; then
   ok "跳过构建，直接启动"
-  compose_up
+  if ! compose_up; then
+    echo "  ${C_R}Compose 启动失败，进入统一失败处理。${C_0}"
+  fi
 else
   echo "  构建镜像（首次约 10 分钟，native 依赖编译；npm 走代理 $PROXY）..."
   if $COMPOSE build --build-arg "HTTP_PROXY=$PROXY" --build-arg "HTTPS_PROXY=$PROXY"; then
@@ -747,24 +1303,40 @@ else
     echo "  修复后重跑本脚本即可。"
     exit 1
   fi
-  compose_up
+  if ! compose_up; then
+    echo "  ${C_R}Compose 启动失败，进入统一失败处理。${C_0}"
+  fi
 fi
 
 # ---------- 等待健康 ----------
 section "8. 等待服务就绪与安全验证"
 if [ "$UP_OK" -ne 1 ]; then
-  warn "容器未成功启动，跳过健康等待与安全验证"
+  fail "容器未成功启动，跳过健康等待与安全验证"
 else
   STATUS="starting"
+  AUTHELIA_STATUS="starting"
+  CADDY_STATUS="starting"
   for i in $(seq 1 40); do
     STATUS=$(docker inspect -f '{{.State.Health.Status}}' dsh 2>/dev/null || echo "starting")
-    [ "$STATUS" = "healthy" ] && break
+    AUTHELIA_STATUS=$(docker inspect -f '{{.State.Health.Status}}' authelia 2>/dev/null || echo "starting")
+    CADDY_STATUS=$(docker inspect -f '{{.State.Health.Status}}' dsh-caddy 2>/dev/null || echo "starting")
+    [ "$STATUS" = "healthy" ] && [ "$AUTHELIA_STATUS" = "healthy" ] && [ "$CADDY_STATUS" = "healthy" ] && break
     sleep 3
   done
   if [ "$STATUS" = "healthy" ]; then
     ok "dsh 健康检查通过"
   else
-    warn "dsh 未在 120 秒内 healthy；运行 docker compose logs dsh 排查"
+    fail "dsh 未在 120 秒内 healthy；运行 docker compose logs dsh 排查"
+  fi
+  if [ "$AUTHELIA_STATUS" = "healthy" ]; then
+    ok "Authelia 容器健康检查通过"
+  else
+    fail "Authelia 容器未在 120 秒内 healthy；运行 docker compose logs authelia 排查"
+  fi
+  if [ "$CADDY_STATUS" = "healthy" ]; then
+    ok "Caddy 容器 healthcheck 通过"
+  else
+    fail "Caddy 容器未在 120 秒内 healthy；运行 docker compose logs caddy 排查"
   fi
 
   # 安全验证：host 网络下 dsh 必须只绑定回环，否则局域网可绕过 Caddy+Authelia 直连
@@ -775,42 +1347,76 @@ else
     LISTEN_3080=$(netstat -ltn 2>/dev/null | awk '{print $4}' | grep -E '[:.]3080$')
   fi
   if [ -z "$LISTEN_3080" ]; then
-    warn "无法读取 3080 绑定地址（ss/netstat 不可用）；请手动确认: ss -ltn | grep 3080 应只有 127.0.0.1:3080"
+    fail "无法读取 3080 绑定地址（ss/netstat 不可用）；拒绝继续部署，请安装 ss 或 netstat 后重试"
   elif printf '%s\n' "$LISTEN_3080" | grep -qvE '^127\.0\.0\.1:3080$'; then
     fail "dsh 监听在非回环地址（$(printf '%s' "$LISTEN_3080" | tr '\n' ' ')）——局域网可绕过鉴权直连！立即处理: docker compose stop dsh，确认 entrypoint.sh 的 --host 127.0.0.1 未被改动"
   else
     ok "dsh 仅监听 127.0.0.1:3080（无法绕过 Caddy+Authelia 直连）"
   fi
 
-  if [ "$ALT_MODE" -eq 1 ]; then
-    ok "备选方案模式：跳过 Authelia 健康检查（authelia 容器未启动）"
-  elif http_get 5 "http://127.0.0.1:9091/api/health" | grep -q '"status":"OK"'; then
+  # Authelia 同样必须只绑定回环；否则可绕过 Caddy 的访问控制接口。
+  LISTEN_9091=$(listener_addresses 9091 2>/dev/null || true)
+  if [ -z "$LISTEN_9091" ]; then
+    fail "无法读取 Authelia 9091 绑定地址（ss/netstat 不可用或服务未监听）；拒绝继续部署"
+  elif printf '%s\n' "$LISTEN_9091" | grep -qvE '^127\.0\.0\.1:9091$' \
+       || [ "$(printf '%s\n' "$LISTEN_9091" | sort -u | wc -l)" -ne 1 ]; then
+    fail "Authelia 监听在非预期地址（$(printf '%s' "$LISTEN_9091" | tr '\n' ' ')）；应仅为 127.0.0.1:9091"
+  else
+    ok "Authelia 仅监听 127.0.0.1:9091"
+  fi
+
+  if [ "$AUTHELIA_STATUS" = "healthy" ] && http_get 5 "http://127.0.0.1:9091/api/health" | grep -q '"status":"OK"'; then
     ok "Authelia 健康"
   else
-    warn "Authelia 未就绪；运行 docker compose logs authelia 排查（常见: 密钥未替换/配置报错）"
+    fail "Authelia 未通过健康检查；运行 docker compose logs authelia 排查（常见: 密钥未替换/配置报错）"
   fi
+
+  if [ "$CADDY_STATUS" = "healthy" ]; then
+    ok "Caddy admin API 健康"
+  else
+    fail "Caddy 未通过 healthcheck；运行 docker compose logs caddy 排查（常见: Caddyfile 语法错误/端口绑定失败）"
+  fi
+
+  CADDY_LISTENERS=$(caddy_listeners 2>/dev/null || true)
+  if [ -z "$CADDY_LISTENERS" ]; then
+    fail "无法从 Caddy admin API 读取 HTTP listener；拒绝继续部署"
+  elif caddy_listener_set_ok; then
+    case "$ENTRY_MODE" in
+      "$MODE_FRONT_PROXY") ok "Caddy 反代模式仅监听回环内部端口 127.0.0.1:$INTERNAL_PORT" ;;
+      "$MODE_DIRECT_80_443") ok "Caddy 直连 80/443 模式仅监听 80 和 443" ;;
+      "$MODE_DIRECT_443_ONLY") ok "Caddy 443-only 模式仅监听 443，未发现 80 listener" ;;
+    esac
+  else
+    fail "Caddy listener 不符合入口模式 $ENTRY_MODE 的安全预期（实际：$(printf '%s ' "$CADDY_LISTENERS")）"
+  fi
+fi
+
+if [ "$FAIL" -gt 0 ] || [ "$UP_OK" -ne 1 ]; then
+  # 升级模式的 EXIT trap 会在退出前恢复版本；普通部署停止当前失败栈，避免留下 unhealthy 服务。
+  if [ "$UPGRADE_MODE" -eq 1 ]; then
+    exit 1
+  fi
+  compose_down_current || true
 fi
 
 # ---------- 总结 ----------
 section "结果"
 echo "  ${C_B}$PASS 项通过 | $WARN 项警告 | $FAIL 项失败${C_0}"
 if [ "$FAIL" -eq 0 ]; then
-  if [ "$ALT_MODE" -eq 1 ]; then
-    echo "  访问: ${C_B}http://<NAS-IP>:${ALT_PORT}${C_0}（Basic Auth 账号密码在 Caddyfile 的 basic_auth 块）"
-  else
-    # 从 Caddyfile 提取实际域名（直连模式行首 https://，反代入口模式行首 http://，统一剥掉前缀）
-    DSH_DOMAIN=$(grep -oE '^https?://dsh\.[^ {]+' "$CADDYFILE" | head -n 1 | sed -E 's#^https?://##')
-    AUTH_DOMAIN=$(grep -oE '^https?://auth\.[^ {]+' "$CADDYFILE" | head -n 1 | sed -E 's#^https?://##')
-    [ -z "$DSH_DOMAIN" ] && DSH_DOMAIN="dsh.example.com"
-    [ -z "$AUTH_DOMAIN" ] && AUTH_DOMAIN="auth.example.com"
-    # pub_url：反代入口非 443 端口时自动带 :端口，直连 443 时省略
-    echo "  访问: ${C_B}$(pub_url "$DSH_DOMAIN")${C_0}"
-    echo "  首次使用: 打开 $(pub_url "$AUTH_DOMAIN") 登录，按提示注册 TOTP（验证码见 authelia/notifications.txt）"
-  fi
+  # 从 Caddyfile 提取实际域名（直连模式行首 https://，反代入口模式行首 http://，统一剥掉前缀）。
+  DSH_DOMAIN=$(grep -oE '^https?://dsh\.[^ {]+' "$CADDYFILE" | head -n 1 | sed -E 's#^https?://##')
+  AUTH_DOMAIN=$(grep -oE '^https?://auth\.[^ {]+' "$CADDYFILE" | head -n 1 | sed -E 's#^https?://##')
+  [ -z "$DSH_DOMAIN" ] && DSH_DOMAIN="dsh.example.com"
+  [ -z "$AUTH_DOMAIN" ] && AUTH_DOMAIN="auth.example.com"
+  # pub_url：反代入口非 443 端口时自动带 :端口，直连 443 时省略。
+  echo "  访问: ${C_B}$(pub_url "$DSH_DOMAIN")${C_0}"
+  echo "  首次使用: 打开 $(pub_url "$AUTH_DOMAIN") 登录，按提示注册 TOTP（验证码见 authelia/data/notifications.txt）"
   echo "  常用: docker compose logs -f dsh | docker compose restart dsh（装插件后）"
 fi
-if [ "$FAIL" -gt 0 ]; then
-  echo "  ${C_R}部署流程结束，但有 $FAIL 项失败（见上）；退出码置为 1，修复后重跑: $0${C_0}"
+if [ "$FAIL" -gt 0 ] || [ "$UP_OK" -ne 1 ]; then
+  echo "  ${C_R}部署流程结束，但有检查或启动失败；退出码置为 1，修复后重跑: $0${C_0}"
   exit 1
 fi
+UPGRADE_COMMITTED=1
+UPGRADE_ROLLBACK_ARMED=0
 exit 0

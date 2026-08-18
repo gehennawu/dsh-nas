@@ -1,5 +1,7 @@
 # dsh-nas Caddy 配置
 #
+# 仅支持域名 + Authelia；无域名 Basic Auth 模式已删除。
+# 向导生成的活跃配置首行会写入 dsh-nas-entry-mode 标记，供 deploy.sh 精确恢复入口模式。
 # 拓扑（三个容器都用 host 网络，127.0.0.1 即 NAS 宿主本身）：
 #   浏览器 ── https://dsh.example.com ──> Caddy ──(forward_auth)──> Authelia(127.0.0.1:9091)
 #                                                  └──> dsh(127.0.0.1:3080)
@@ -7,18 +9,49 @@
 # 本文件为占位模板：直接运行 ./deploy.sh，配置向导会自动改写（备份 .bak）；
 # 也可手动编辑后运行（脚本检测到占位符已替换即跳过向导）。
 #
-# 两种公网入口模式（向导会问）：
-#   模式 1「Caddy 直连」：域名 AAAA/A 记录直指 NAS（DDNS），IPv6/IPv4 放行 443。
-#         站点块显式 https://（443-only），证书走 TLS-ALPN-01 自动签发——
-#         不需要 80 端口（NAS 系统组件如极空间 openresty 占用 80 也无碍）。
-#   模式 2「反代入口」：公网 TLS 由 lucky/CF Tunnel 等前置反代终结，
-#         Caddy 转内部 http（auto_https off + http_port 13080），
+# 三种公网入口模式（向导会问）：
+#   模式 1「Caddy 直连 443-only」：域名 AAAA/A 记录直指 NAS，放行 443；
+#         站点块显式 https://，关闭 HTTP→HTTPS 跳转；证书自动化仍启用，
+#         默认会尝试 TLS-ALPN-01，因此不需要 80 端口。
+#   模式 2「Caddy 直连 80/443」：域名直指 NAS，放行 80 和 443；
+#         保留 HTTP→HTTPS 跳转，也可使用 ACME HTTP-01。
+#   模式 3「前置反代 / Tunnel」：公网 TLS 由 lucky/CF Tunnel 等前置反代终结，
+#         Caddy 转内部 http（auto_https off + http_port 13080 + default_bind 127.0.0.1），
 #         并强制 X-Forwarded-Proto: https 告知 Authelia 原始协议。
 #         lucky/CF 的监听端口（如 16666）会写进所有公网 URL。
 # ============================================================
 
 # ============================================================
 # 模式 1（Caddy 直连公网，443-only）— 由向导按选择生成
+# ============================================================
+# {
+#     email admin@example.com
+#     auto_https disable_redirects
+# }
+#
+# https://auth.example.com {
+#     reverse_proxy 127.0.0.1:9091
+# }
+#
+# https://dsh.example.com {
+#     forward_auth 127.0.0.1:9091 {
+#         uri /api/authz/forward-auth?authelia_url=https://auth.example.com
+#         copy_headers Remote-User Remote-Groups Remote-Email Remote-Name
+#         @authfail {
+#             status 401
+#         }
+#         handle_response @authfail {
+#             redir {http.response.header.Location} 302
+#         }
+#     }
+#     reverse_proxy 127.0.0.1:3080 {
+#         header_up Host 127.0.0.1:3080
+#         header_up Origin http://127.0.0.1:3080
+#     }
+# }
+
+# ============================================================
+# 模式 2（Caddy 直连公网，80/443）示例 — 由向导按选择生成
 # ============================================================
 # {
 #     email admin@example.com
@@ -46,11 +79,12 @@
 # }
 
 # ============================================================
-# 模式 2（lucky / CF Tunnel 反代入口，Caddy 内部 http）— 由向导按选择生成
+# 模式 3（lucky / CF Tunnel 反代入口，Caddy 内部 http）— 由向导按选择生成
 # ============================================================
 # {
 #     auto_https off
 #     http_port 13080
+#     default_bind 127.0.0.1
 # }
 #
 # http://auth.example.com {
@@ -77,8 +111,3 @@
 #         header_up X-Forwarded-Proto https
 #     }
 # }
-
-# ============================================================
-# 备选方案：无域名、纯内网 IP 访问（如 http://192.168.1.100:13080）
-# 由向导选择生成；此方案不需要 Authelia，可把 authelia 容器从 compose 里去掉。
-# ============================================================

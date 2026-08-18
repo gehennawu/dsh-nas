@@ -72,10 +72,10 @@ regulation:
 storage:
   encryption_key: 'CHANGE_ME_storage_encryption_key'
   local:
-    path: /config/db.sqlite3
+    path: /config/data/db.sqlite3
 
 # 文件通知器：TOTP 注册码、重置密码码会写入该文件，
 # 部署时从 NAS 宿主读取（见 README）
 notifier:
   filesystem:
-    filename: /config/notifications.txt
+    filename: /config/data/notifications.txt
