@@ -62,10 +62,7 @@ RUN mkdir -p /workspace /home/node/.dsh \
  && usermod -d /workspace node
 WORKDIR /workspace
 
-# 固化插件：安全重启 dsh web（entrypoint 启动时自动安装到 web profile）
-COPY plugins/restart-dsh /opt/dsh-plugins/restart-dsh
-
-# 容器入口脚本（代理环境变量、固化插件安装、显式绑定回环启动 dsh web）
+# 容器入口脚本（代理环境变量、显式绑定回环启动 dsh web）
 # tini 会 exec 至该路径，缺失则容器启动即失败（exit 127: No such file）
 COPY entrypoint.sh /usr/local/bin/dsh-entrypoint
 RUN chmod +x /usr/local/bin/dsh-entrypoint

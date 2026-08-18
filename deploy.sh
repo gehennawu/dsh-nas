@@ -28,11 +28,10 @@ UPGRADE_SWITCHED=0
 UPGRADE_SWITCH_ATTEMPTED=0
 UPGRADE_LOCK_FD=9
 UPGRADE_TXN_DIR=""
-# 升级快照和锁必须脱离 UID 1000 可写的运行数据目录，避免回滚时被容器篡改。
-# CLI 直接升级默认把事务快照放在项目 data 下；受限 systemd 处理器显式传入
-# root-only 的 /var/lib/dsh-nas-upgrade，避免容器 UID 1000 可写目录影响 root 回滚。
-UPGRADE_RESTRICTED_MODE="${DSH_NAS_RESTRICTED_UPGRADE:-0}"
-UPGRADE_STATE_ROOT="${DSH_NAS_UPGRADE_STATE_DIR:-$SCRIPT_DIR/data/upgrade-config-backup}"
+# 升级快照和锁放在 root-only 状态目录，脱离一切 UID 1000 可写/可改名的项目路径
+# （README 的 chown 只覆盖 data/dsh 与 data/workspace），避免回滚时被容器篡改。
+# 升级只能由宿主机 CLI 以 root（sudo）执行。
+UPGRADE_STATE_ROOT="/var/lib/dsh-nas-upgrade"
 UPGRADE_BACKUP_ROOT="$UPGRADE_STATE_ROOT/config-backup"
 UPGRADE_ENV_EARLY_DIR=""
 COMPOSE=""
@@ -104,10 +103,6 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-if [ "$UPGRADE_RESTRICTED_MODE" = 1 ] && [ "$UPGRADE_MODE" -ne 1 ]; then
-  echo "错误: 受限升级处理器只能以 --upgrade 或 --latest 调用" >&2
-  exit 1
-fi
 if [ "$UPGRADE_MODE" -eq 1 ] && [ "$SKIP_BUILD" -eq 1 ]; then
   echo "错误: --upgrade/--latest 不能与 --skip-build 同时使用；升级必须重新构建 dsh 镜像"
   exit 1
@@ -156,14 +151,6 @@ atomic_replace_file() { # $1=temporary file $2=target file
   dir=$(dirname "$target")
   sync -d "$dir" 2>/dev/null || true
 }
-atomic_write_text() { # stdin -> $1
-  local target="$1" tmp
-  tmp=$(mktemp "${target}.tmp.XXXXXX") || return 1
-  if ! cat >"$tmp" || ! atomic_replace_file "$tmp" "$target"; then
-    rm -f "$tmp"
-    return 1
-  fi
-}
 update_dsh_version_atomic() { # $1=validated version
   local version="$1" file="$SCRIPT_DIR/Dockerfile" tmp count
   [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$ ]] || return 1
@@ -183,7 +170,7 @@ update_dsh_version_atomic() { # $1=validated version
 upgrade_lock() {
   [ "$UPGRADE_MODE" -eq 1 ] || return 0
   mkdir -p "$UPGRADE_STATE_ROOT" "$UPGRADE_BACKUP_ROOT" \
-    || { echo "错误: 无法创建宿主机升级状态目录: $UPGRADE_STATE_ROOT"; exit 1; }
+    || { echo "错误: 无法创建宿主机升级状态目录: $UPGRADE_STATE_ROOT（升级需要 root，请使用 sudo 运行）"; exit 1; }
   chmod 700 "$UPGRADE_STATE_ROOT" "$UPGRADE_BACKUP_ROOT" 2>/dev/null \
     || { echo "错误: 无法限制宿主机升级状态目录权限"; exit 1; }
   if [ "$(id -u)" -eq 0 ]; then
@@ -200,7 +187,10 @@ upgrade_lock() {
     chmod 600 "$UPGRADE_STATE_ROOT/.upgrade.lock" 2>/dev/null || exit 1
     [ "$(id -u)" -ne 0 ] || chown root:root "$UPGRADE_STATE_ROOT/.upgrade.lock" 2>/dev/null || exit 1
   fi
-  eval "exec $UPGRADE_LOCK_FD>\"$UPGRADE_STATE_ROOT/.upgrade.lock\""
+  if ! eval "exec $UPGRADE_LOCK_FD>\"$UPGRADE_STATE_ROOT/.upgrade.lock\""; then
+    echo "错误: 无法打开升级锁文件（升级需要 root，请使用 sudo 运行）" >&2
+    exit 1
+  fi
   if command -v flock >/dev/null 2>&1; then
     flock -n "$UPGRADE_LOCK_FD" || { echo "错误: 已有另一个升级/部署事务运行；请等待其完成"; exit 1; }
   else
@@ -213,6 +203,8 @@ upgrade_lock() {
     suffix="$(date +%Y%m%d-%H%M%S)-$$-$RANDOM"
     UPGRADE_TXN_DIR="$UPGRADE_BACKUP_ROOT/$suffix"
   done
+  # 事务快照只保留最近 5 次，避免长期升级无限累积
+  ls -1dt "$UPGRADE_BACKUP_ROOT"/*/ 2>/dev/null | tail -n +6 | xargs -r rm -rf --
   UPGRADE_BACKUP_DIR="$UPGRADE_TXN_DIR"
   UPGRADE_ENV_EARLY_DIR="$UPGRADE_BACKUP_DIR/.env-before"
   mkdir -m 700 "$UPGRADE_ENV_EARLY_DIR" || { echo "错误: 无法创建 .env 早期快照目录"; exit 1; }
@@ -269,9 +261,6 @@ backup_upgrade_configs() {
   printf '%s\n' "$UPGRADE_OLD_IMAGE_ID" > "$backup_dir/old-image-id"
   chmod 600 "$backup_dir"/* 2>/dev/null || true
   chmod 700 "$backup_dir" 2>/dev/null || true
-  atomic_write_text "$UPGRADE_STATE_ROOT/upgrade-config-backup.path" <<EOF
-$backup_dir
-EOF
   UPGRADE_ROLLBACK_ARMED=1
 }
 restore_upgrade_version() {
@@ -574,7 +563,10 @@ caddy_listener_set_ok() {
 
 # ---------- 配置向导：域名 / 邮箱 / 密钥 / 鉴权密码 自动写入 ----------
 backup_file() { # $1=path
-  [ -f "$1" ] && cp "$1" "$1.bak"
+  if [ -f "$1" ]; then
+    cp "$1" "$1.bak"
+    chmod 600 "$1.bak" 2>/dev/null || true
+  fi
 }
 
 # 随机密钥（openssl 优先，/dev/urandom 兜底）
@@ -899,9 +891,7 @@ fi
 # ---------- 必要文件 ----------
 section "2. 文件完整性"
 for f in Dockerfile entrypoint.sh docker-compose.yml \
-          caddy/Caddyfile authelia/configuration.yml authelia/users_database.yml \
-          plugins/restart-dsh/package.json plugins/restart-dsh/index.js \
-          plugins/restart-dsh/client.js plugins/restart-dsh/cordis.patch.yml; do
+          caddy/Caddyfile authelia/configuration.yml authelia/users_database.yml; do
   if [ -f "$SCRIPT_DIR/$f" ]; then ok "$f"; else fail "$f 缺失"; fi
 done
 
@@ -1039,6 +1029,17 @@ section "4. 配置检查（密钥 / 密码 / 域名）"
   else
     ok "域名占位符已替换"
   fi
+  # Authelia 配置含会话/JWT/存储密钥和密码哈希，宿主上必须 0600，防止同机其它用户读取
+  for f in "$AUTHELIA_CONF" "$USERS_DB" "$AUTHELIA_CONF.bak" "$USERS_DB.bak"; do
+    [ -f "$f" ] || continue
+    if [ "$(stat -c '%a' "$f" 2>/dev/null)" = "600" ]; then
+      ok "$(basename "$f") 权限为 0600"
+    elif chmod 600 "$f" 2>/dev/null; then
+      ok "已收紧 $(basename "$f") 权限为 0600"
+    else
+      fail "$(basename "$f") 含密钥/密码哈希但无法收紧到 0600；请手动执行 chmod 600"
+    fi
+  done
 
 # ---------- 数据目录权限 ----------
 section "5. 数据目录权限（容器内以 UID 1000 运行）"
@@ -1411,7 +1412,7 @@ if [ "$FAIL" -eq 0 ]; then
   # pub_url：反代入口非 443 端口时自动带 :端口，直连 443 时省略。
   echo "  访问: ${C_B}$(pub_url "$DSH_DOMAIN")${C_0}"
   echo "  首次使用: 打开 $(pub_url "$AUTH_DOMAIN") 登录，按提示注册 TOTP（验证码见 authelia/data/notifications.txt）"
-  echo "  常用: docker compose logs -f dsh | docker compose restart dsh（装插件后）"
+  echo "  常用: docker compose logs -f dsh | docker compose restart dsh（社区插件增删后同样需要重启）"
 fi
 if [ "$FAIL" -gt 0 ] || [ "$UP_OK" -ne 1 ]; then
   echo "  ${C_R}部署流程结束，但有检查或启动失败；退出码置为 1，修复后重跑: $0${C_0}"

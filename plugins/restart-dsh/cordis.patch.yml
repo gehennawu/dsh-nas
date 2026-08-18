@@ -1,6 +1,0 @@
-# restart-dsh bundle patch：一行 = 一个包
-# host 半（main → index.js）：注册 /restart-dsh RPC 通道（loopback 信任栅栏）
-# client 半（dsh.client → exports["./client"] → client.js）：设置页「服务控制」
-- insert:
-    - id: restart-dsh
-      name: '@dsh-nas/restart-dsh'

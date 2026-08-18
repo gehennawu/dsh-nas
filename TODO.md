@@ -2,11 +2,11 @@
 
 > 当前项目不是通用 NAS 部署方案，而是面向 Linux + Docker Engine + Docker Compose V2 + Bash/GNU 工具 + host 网络 + 本地可写目录的部署模板。
 >
-> 在受限升级代理完成前，默认不启用网页升级；不建议将 Docker socket 挂载到 dsh 主容器。
+> 网页升级当前不提供；不建议将 Docker socket 挂载到 dsh 主容器。
 >
 > ## 已确定的架构决策
 >
-> - **网页升级**：先实现宿主机受限升级代理；在代理完成前关闭 dsh 直接访问 Docker socket 的网页升级能力。
+> - **网页升级**：已移除「请求签发器 + systemd timer 处理器」链路（HMAC 对 root-only 权限模型冗余，且容器内网页无法安全触发宿主命令）；如重启该需求，按「宿主回环 agent 挂在 Caddy forward_auth 之后、只触发固定 deploy.sh --latest」的形态另行设计。在此之前只提供 SSH CLI 升级。
 > - **Caddy 入口**：支持 80/443 直连、443-only 直连、前置反代/Tunnel + 内部端口三种模式。
 > - **端口冲突**：部署脚本检测到冲突时交互询问，不静默切换；用户也可以退出后手动处理。
 > - **网络范围**：当前版本只支持 Linux host 网络；暂不实现项目容器的 bridge 网络模式。
@@ -99,19 +99,16 @@
 
 - [x] 删除 `docker-compose.yml` 中 `${DOCKER_GID:-0}` 的危险默认值。
 - [x] 在未明确配置可信 Docker socket GID 时，禁止网页升级功能。
-- [x] 移除 dsh 主容器的 `/var/run/docker.sock` 挂载，并在受限升级代理完成前关闭网页升级。
-- [x] 实现 `upgrade-request.json` + HMAC + 宿主机 systemd timer 的受限升级请求链路；网页升级仍只负责签发请求，不直接控制 Docker。
-- [x] 在升级执行前原子占用 `request_id`，成功/失败请求均安全归档，拒绝重放和归档覆盖。
-- [x] 处理器固定 `/opt/dsh-nas` 项目路径，校验代码树 root 所有权/不可写属性，并把请求、日志、重放记录和升级快照放在 root-only 状态目录。
-- [ ] 在真实管理页接入签发器，并完成管理员认证、CSRF/Origin 校验、速率限制和状态展示后，再评估恢复网页升级入口；单独升级容器不能直接挂 Docker socket。
+- [x] 移除 dsh 主容器的 `/var/run/docker.sock` 挂载，并关闭网页升级。
+- [x] 已移除 `upgrade-request.json` + HMAC + systemd timer 的受限升级请求链路（`tools/`、`systemd/` 已删除）：该链路无可用的容器→宿主触发通路，HMAC 对 root-only 权限模型冗余。
+- [ ] 网页升级如重新立项：实现宿主回环升级 agent，挂在现有 Caddy forward_auth（Authelia 2FA）之后，只允许触发 `deploy.sh --latest` 和读取状态，并补审计日志与速率限制；不引入 Docker socket、sudo 白名单或容器内宿主凭据。
 - [x] 删除升级流程中的所有 `chmod 666`，特别是对 `.env` 的权限修改。
 - [x] 保持 `.env` 为受限权限；升级早期快照和事务快照使用 `0600`，目录使用 `0700`。
 - [x] 将升级快照、状态路径和旧容器 inspect 文件限制为 `0600/0700`；完整审计日志仍待后续。
 - [ ] 对代理 URL、用户名、密码、token 和构建日志进行脱敏。
 - [x] 版本文件和升级状态路径使用临时文件、fsync 和原子 rename，避免半写入。
 - [ ] 后端增加网页升级的管理员/capability 检查，不能只依赖前端按钮隐藏（当前网页升级关闭）。
-- [ ] 管理页接入请求签发器后，增加网页升级审计日志、CSRF/Origin 校验和速率限制（当前处理器本身不提供网页认证）。
-- [ ] 在目标 NAS 以 `/opt/dsh-nas` root-owned 安装路径执行一次 systemd 单元验证和真实请求/重放回归。
+- [ ] 管理页接入后，增加网页升级审计日志、CSRF/Origin 校验和速率限制。
 - [x] 不再按 `ancestor: dsh:local` 直接取第一个容器（旧网页升级路径已移除）。
 - [x] 按固定容器名和 canonical 项目路径校验升级目标；Compose labels/镜像 digest 校验仍待后续增强。
 
@@ -169,8 +166,6 @@
 - [x] 将配置、版本和旧镜像快照纳入升级失败恢复流程；完整蓝绿/事务切换仍待后续加强。
 - [x] Compose 启动失败明确返回非零，并在升级模式进入统一失败/回滚处理。
 - [x] 构建、启动、健康检查和 listener 校验通过后才清除升级回滚保护。
-- [x] 处理器状态文件只在宿主机升级完成且 deploy.sh 返回 0 后写入 `succeeded`；提供只读状态读取器，前端接入仍待完成。
-- [ ] 管理页只有在读取到处理器 `succeeded` 状态后才显示“升级成功”，并用状态/运行中标志禁用重复请求。
 - [x] 使用 GNU `flock` 锁覆盖升级检查、快照、版本写入、构建和切换全流程。
 - [x] 升级模式复用 Compose/Caddy 启动前配置校验；当前升级保留配置并明确跳过 Authelia 内容校验。
 
@@ -182,10 +177,7 @@
 - [ ] 所有 Docker API 请求统一检查 HTTP 状态码。
 - [ ] 清理 helper 容器前验证 `dsh-nas.upgrade=true` 等归属 label。
 - [ ] 固定并校验 helper 镜像 digest。
-- [x] 使用固定 canonical 项目目录 `/opt/dsh-nas`，拒绝 symlink、`..` 和任意宿主路径。
-- [x] 不使用通用 helper 容器；systemd 只允许固定 root-owned `/opt/dsh-nas` 项目树和 root-only 状态目录。
-- [x] 设计宿主机受限升级执行器，替代 dsh 直接访问 Docker socket；采用 root systemd/sudo 白名单执行器，不使用普通 Docker 管理容器。
-- [x] 请求处理器只允许固定项目、固定命令、固定版本规则和固定状态目录，并校验 HMAC、时效、权限、单行 canonical JSON、重放 ledger 和并发锁。
+- [x] 不使用通用 helper 容器；升级只由宿主机 CLI 以 root 执行（sudo deploy.sh --upgrade/--latest），不引入 Docker 管理容器。
 
 ## P1：代理和网络兼容性
 
@@ -223,7 +215,7 @@
 ## P2：测试矩阵
 
 - [x] `bash -n deploy.sh entrypoint.sh`（已对当前安全止血步骤验证；后续配置变更需重复验证）。
-- [x] `node --check` 插件 JavaScript（已对当前安全止血步骤验证；后续配置变更需重复验证）。
+- [x] `node --check` 插件 JavaScript（固化插件已移除，仓库不再分发插件代码；社区插件由 dsh CLI 自行管理）。
 - [x] `docker compose config --quiet`（已对当前安全止血步骤验证；后续配置变更需重复验证）。
 - [x] Caddy 80/443 模式配置适配和运行时 listener 测试（已完成配置适配；真实公网监听仍需目标 NAS 验证）。
 - [x] Caddy 443-only 模式配置适配和无 80 listener 测试（TLS-ALPN 公网流程仍需目标 NAS 验证）。
