@@ -1086,7 +1086,9 @@ check_container_dir_perm() { # $1=path $2=用途说明
   fi
 }
 write_test_as_container_root() { # $1=directory $2=用途说明 $3=image
-  local dir="$1" label="$2" image="$3" probe_name=".dsh-nas-root-write-test.$$" probe="$1/$probe_name"
+  # 注意：local 一行内的赋值是先展开后赋值，probe 引用 probe_name 必须拆成第二条 local
+  local dir="$1" label="$2" image="$3" probe_name=".dsh-nas-root-write-test.$$"
+  local probe="$dir/$probe_name"
   if [ "$(id -u)" -eq 0 ] \
      && sh -c 'p="$1"; printf "ok\\n" >"$p" && rm -f "$p"' sh "$probe" >/dev/null 2>&1 \
      && [ ! -e "$probe" ]; then
@@ -1102,7 +1104,9 @@ write_test_as_container_root() { # $1=directory $2=用途说明 $3=image
   fi
 }
 write_test_as_uid1000() { # $1=directory $2=用途说明
-  local dir="$1" label="$2" probe_name=".dsh-nas-write-test.$$" probe="$1/$probe_name"
+  # 注意：local 一行内的赋值是先展开后赋值，probe 引用 probe_name 必须拆成第二条 local
+  local dir="$1" label="$2" probe_name=".dsh-nas-write-test.$$"
+  local probe="$dir/$probe_name"
   # 首次部署时镜像尚未构建，优先用真实 UID 1000 做宿主文件系统测试。
   if [ "$(id -u)" -eq 1000 ] \
      && sh -c 'p="$1"; printf "ok\\n" >"$p" && rm -f "$p"' sh "$probe" >/dev/null 2>&1 \
