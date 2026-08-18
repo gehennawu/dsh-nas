@@ -124,6 +124,8 @@ dsh 是能执行任意命令的 AI Agent，凭据一旦被拿走就是整台 NAS
 
    不要对整个 `data/` 做 `chown -R`：`data/` 本身保持部署用户所有，容器只需要写入上面两个子目录。
 
+   往 `data/workspace` 放入文件（SSH/SMB/文件管理器拷贝）后，属主通常不是 UID 1000，agent 只读不可写；拷贝完成后执行 `sudo chown -R 1000:1000 data/workspace` 修正（该目录为容器专属，整目录递归 chown 安全）。在 dsh 网页里新建的目录以 UID 1000 创建，无此问题。
+
    Authelia/Caddy 配置文件只读挂载；`authelia/data/`、`caddy/data/`、`caddy/config/` 由对应容器写入，`deploy.sh` 会做实际写入测试。
 
 4. **SSH 和 Docker 权限**：能在 NAS 上执行 Docker 命令。
