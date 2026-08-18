@@ -51,12 +51,15 @@ access_control:
       policy: two_factor
 
 # 会话：cookie 挂在父域上，auth 与 dsh 两个子域共享登录态。
+# 不勾「记住我」：1 小时上限、5 分钟无操作失效；勾选后按 remember_me（默认 1 个月），
+# 覆盖上面两个限制。要收紧改短 remember_me 或删掉「记住我」需求。
 # 新版要求每 cookie 自带 default_redirection_url（不可与全局 default_redirection_url 共存）。
 session:
   name: authelia_session
   secret: 'CHANGE_ME_session_secret'
   expiration: 1h
   inactivity: 5m
+  remember_me: 1M
   cookies:
     - domain: 'example.com'
       authelia_url: 'https://auth.example.com'
