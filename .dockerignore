@@ -1,4 +1,4 @@
-# 构建只需要 Dockerfile 与 entrypoint.sh；其余一律不进 build context，
+# 构建只需要 Dockerfile、entrypoint.sh 和可选 patch 脚本；其余一律不进 build context，
 # 避免运行数据、SQLite、证书、.env 和密钥备份被打包发送给 Docker daemon。
 .git
 data

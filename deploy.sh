@@ -20,6 +20,8 @@ WORKSPACE_DIR="$SCRIPT_DIR/data/workspace"
 PROXY="http://127.0.0.1:7890"
 SKIP_BUILD=0
 SETUP_FORCE=0
+SETUP_WIZARD_RAN=0
+DSH_TRUSTED_DOMAIN_CHANGED=0
 UPGRADE_MODE=0
 LATEST_MODE=0
 UPGRADE_ROLLBACK_ARMED=0
@@ -83,9 +85,10 @@ usage() {
   echo "  --proxy-host ADDR   代理地址（如 192.168.1.5:7890）；构建与运行时都生效，"
   echo "                      写入 .env 的 DSH_PROXY（compose 自动读取）"
   echo "  --setup             强制重跑配置向导（可换域名/入口/密码；原文件备份为 .bak，Authelia 密钥保留）"
-  echo "  --upgrade           升级模式：跳过配置向导，只构建并启动 dsh（不改 Caddy/Authelia）"
+  echo "                      向导还会选择是否启用反代域名 patch，并保存 DSH_TRUSTED_DOMAIN"
+  echo "  --upgrade           升级模式：跳过 Caddy/Authelia 向导，但仍询问是否启用/更新 dsh 域名 patch"
   echo "  --latest            自动升级到 npm 最新版：查询 @deepseek-ai/dsh latest，更新版本号后"
-  echo "                      构建（隐含 --upgrade；需已完成一次正常部署）"
+  echo "                      构建（隐含 --upgrade；需已完成一次正常部署；仍询问 patch）"
 }
 
 while [ $# -gt 0 ]; do
@@ -109,7 +112,7 @@ if [ "$UPGRADE_MODE" -eq 1 ] && [ "$SKIP_BUILD" -eq 1 ]; then
 fi
 
 # ---------- .env 幂等写入（保留其它配置行） ----------
-# 升级模式必须先锁定并保存原始 .env，再允许 --proxy-host 写入新值。
+# 升级模式必须先锁定并保存原始 .env，再允许 --proxy-host/patch 选择写入新值。
 # 该早期快照只负责恢复 .env；完整配置快照在环境检查阶段继续建立。
 capture_upgrade_env_before_mutation() {
   [ "$UPGRADE_MODE" -eq 1 ] || return 0
@@ -130,11 +133,125 @@ capture_upgrade_env_before_mutation() {
   UPGRADE_ENV_ROLLBACK_ARMED=1
 }
 env_upsert() { # $1=key $2=value
+  local key="$1" value="$2" tmp
   touch "$ENV_FILE" 2>/dev/null || return 1
-  if grep -q "^$1=" "$ENV_FILE" 2>/dev/null; then
-    sed -i "s|^$1=.*|$1=$2|" "$ENV_FILE"
+  tmp=$(mktemp "${ENV_FILE}.tmp.XXXXXX") || return 1
+  if ! awk -v key="$key" -v value="$value" '
+    BEGIN { prefix = key "="; found = 0 }
+    index($0, prefix) == 1 {
+      if (!found) { print prefix value; found = 1 }
+      next
+    }
+    { print }
+    END { if (!found) print prefix value }
+  ' "$ENV_FILE" >"$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  if ! atomic_replace_file "$tmp" "$ENV_FILE"; then
+    rm -f "$tmp"
+    return 1
+  fi
+}
+
+# ---------- DSH 反代域名 patch 选择 ----------
+# DSH_TRUSTED_DOMAIN 只保存 hostname，不含协议、端口或路径。
+# 空值表示保持原始 loopback-only 行为；非空值由 Compose 作为 Docker build arg
+# 传给 Dockerfile，在 root 构建阶段 patch 两个 dsh-client-connection bundle。
+valid_trusted_domain() { # $1=hostname
+  local domain="$1"
+  [ -n "$domain" ] || return 0
+  [[ "$domain" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]]
+}
+
+configure_trusted_domain() { # $1=已保存 hostname $2=当前 Caddy dsh hostname（可选）
+  local saved_domain="$1" suggested_domain="${2:-}" answer="" domain="" confirm=""
+  if [ ! -t 0 ]; then
+    fail "DSH patch 选择需要交互终端；请在 SSH 终端运行升级，不能通过非交互管道跳过选择"
+    return 1
+  fi
+
+  saved_domain="${saved_domain,,}"
+  suggested_domain="${suggested_domain,,}"
+  if [ -n "$saved_domain" ] && ! valid_trusted_domain "$saved_domain"; then
+    fail ".env 中的 DSH_TRUSTED_DOMAIN 无效: $saved_domain（只允许 hostname，不含协议、端口、路径或空格）"
+    return 1
+  fi
+  if [ -n "$suggested_domain" ] && ! valid_trusted_domain "$suggested_domain"; then
+    fail "Caddyfile 中的 dsh hostname 无效: $suggested_domain"
+    return 1
+  fi
+
+  DSH_TRUSTED_DOMAIN_CHANGED=0
+  echo
+  echo "  DSH 反代域名 patch（可选）"
+  echo "  作用：让反向代理域名访问时也能使用 rc8+ 的 settings/credentials 等特权 RPC。"
+  echo "  安全前提：必须已有 HTTPS + Authelia/其它独立认证层。"
+  if [ -n "$saved_domain" ]; then
+    echo "  .env 当前 hostname: $saved_domain"
+    if [ -n "$suggested_domain" ] && [ "$saved_domain" != "$suggested_domain" ]; then
+      echo "  Caddy 当前 dsh hostname: $suggested_domain"
+      printf "  回车使用 Caddy 当前 hostname，输入 n 关闭，或输入新的 hostname: "
+      read_line answer || return 1
+      case "$answer" in
+        "") domain="$suggested_domain" ;;
+        n|N|no|NO|否) domain="" ;;
+        *) domain="$answer" ;;
+      esac
+    else
+      printf "  回车保留，输入 n 关闭，或输入新的 hostname 更换: "
+      read_line answer || return 1
+      case "$answer" in
+        "") domain="$saved_domain" ;;
+        n|N|no|NO|否) domain="" ;;
+        *) domain="$answer" ;;
+      esac
+    fi
   else
-    printf '%s=%s\n' "$1" "$2" >>"$ENV_FILE"
+    printf "  是否启用 patch？[y/N]: "
+    read_line answer || return 1
+    case "$answer" in
+      y|Y|yes|YES|是)
+        if [ -n "$suggested_domain" ]; then
+          printf "  输入 DSH 公网 hostname [%s]（不含协议/端口）: " "$suggested_domain"
+        else
+          printf "  输入 DSH 公网 hostname（如 dsh.example.com，不含协议/端口）: "
+        fi
+        read_line domain || return 1
+        [ -n "$domain" ] || domain="$suggested_domain"
+        ;;
+      *)
+        domain=""
+        ;;
+    esac
+  fi
+
+  domain="${domain,,}"
+  if [ -n "$domain" ] && ! valid_trusted_domain "$domain"; then
+    fail "无效 DSH patch hostname: $domain（只允许 hostname，不含协议、端口、路径或空格）"
+    return 1
+  fi
+  if [ -n "$domain" ]; then
+    printf "  确认启用 patch，hostname = %s？[Y/n]: " "$domain"
+    read_line confirm || return 1
+    case "$confirm" in
+      n|N|no|NO|否) domain="" ;;
+    esac
+  fi
+
+  DSH_TRUSTED_DOMAIN="$domain"
+  [ "$saved_domain" = "$DSH_TRUSTED_DOMAIN" ] || DSH_TRUSTED_DOMAIN_CHANGED=1
+  if [ -n "$DSH_TRUSTED_DOMAIN" ]; then
+    ok "已启用 DSH 反代域名 patch: $DSH_TRUSTED_DOMAIN"
+  else
+    ok "不启用 DSH 反代域名 patch，保持原始 loopback-only 行为"
+  fi
+}
+
+persist_trusted_domain() {
+  if [ "$DSH_TRUSTED_DOMAIN_CHANGED" -eq 1 ] || ! grep -q '^DSH_TRUSTED_DOMAIN=' "$ENV_FILE" 2>/dev/null; then
+    env_upsert DSH_TRUSTED_DOMAIN "$DSH_TRUSTED_DOMAIN" || return 1
+    ok "已保存 DSH_TRUSTED_DOMAIN=${DSH_TRUSTED_DOMAIN:-（未启用 patch）}"
   fi
 }
 
@@ -467,15 +584,35 @@ normalize_proxy() { # $1=addr
 }
 ENV_FILE="$SCRIPT_DIR/.env"
 SAVED_PROXY=""
-[ -f "$ENV_FILE" ] && SAVED_PROXY=$(sed -n 's/^DSH_PROXY=//p' "$ENV_FILE" | head -n 1)
+SAVED_TRUSTED_DOMAIN=""
+TRUSTED_DOMAIN_COUNT=0
+if [ -f "$ENV_FILE" ]; then
+  SAVED_PROXY=$(sed -n 's/^DSH_PROXY=//p' "$ENV_FILE" | head -n 1)
+  TRUSTED_DOMAIN_COUNT=$(grep -c '^DSH_TRUSTED_DOMAIN=' "$ENV_FILE" 2>/dev/null || true)
+  if [ "$TRUSTED_DOMAIN_COUNT" -gt 1 ]; then
+    echo "错误: $ENV_FILE 中存在多个 DSH_TRUSTED_DOMAIN，无法安全判断 patch 状态"
+    exit 1
+  fi
+  SAVED_TRUSTED_DOMAIN=$(sed -n 's/^DSH_TRUSTED_DOMAIN=//p' "$ENV_FILE" | head -n 1)
+fi
 SAVED_PROXY="${SAVED_PROXY%$'\r'}"   # .env 被 Windows 编辑器存成 CRLF 时剥掉回车
+SAVED_TRUSTED_DOMAIN="${SAVED_TRUSTED_DOMAIN%$'\r'}"
+if ! valid_trusted_domain "$SAVED_TRUSTED_DOMAIN"; then
+  echo "错误: $ENV_FILE 中的 DSH_TRUSTED_DOMAIN 无效: $SAVED_TRUSTED_DOMAIN（只允许 hostname，不含协议、端口或路径）"
+  exit 1
+fi
+DSH_TRUSTED_DOMAIN="$SAVED_TRUSTED_DOMAIN"
+if [ "$UPGRADE_MODE" -eq 1 ] && ! capture_upgrade_env_before_mutation; then
+  echo "错误: 无法在升级前保存原始 .env，拒绝继续升级"
+  exit 1
+fi
 if [ "$SET_PROXY_ARG" -eq 1 ]; then
   if [ "$UPGRADE_MODE" -eq 1 ] && ! capture_upgrade_env_before_mutation; then
     echo "错误: 无法在升级前保存原始 .env，拒绝修改代理配置"
     exit 1
   fi
   if [ "$PROXY" != "$SAVED_PROXY" ]; then
-    env_upsert DSH_PROXY "$PROXY"
+    env_upsert DSH_PROXY "$PROXY" || return 1
     ok "运行时代理已写入 $ENV_FILE：DSH_PROXY=$PROXY"
   fi
 elif [ -n "$SAVED_PROXY" ]; then
@@ -584,13 +721,17 @@ authelia_hash() { # $1=password；成功输出哈希到 stdout
 
 # 读取一行输入（IFS 含 \r：剥离 Windows 管道可能注入的回车符，保留内部空格）
 read_line() { # $1=变量名
-  IFS=$'\t\n\r' read -r "$1"
+  local name="$1" rc
+  IFS=$'\t\n\r' read -r "$name"; rc=$?
+  return "$rc"
 }
 
 # 读取隐藏密码（不回显；\r 同样剥离）
 read_secret() { # $1=变量名
-  IFS=$'\n\r' read -s -r "$1"
+  local name="$1" rc
+  IFS=$'\n\r' read -s -r "$name"; rc=$?
   echo
+  return "$rc"
 }
 
 run_setup_wizard() {
@@ -616,6 +757,7 @@ run_setup_wizard() {
     fail "检测到配置未完成，但当前不是交互终端；请 SSH 交互运行本脚本，或按 README 手动修改配置"
     return 1
   fi
+  SETUP_WIZARD_RAN=1
   echo
   echo "  ${C_B}== 配置向导 ==${C_0}（检测到占位配置，将自动写入；原文件备份为 .bak）"
   # 代理地址（构建 + 运行时统一）。注意：NAS 上构建容器内的 127.0.0.1 是容器自身、
@@ -625,12 +767,12 @@ run_setup_wizard() {
     echo "  当前代理: $PROXY（.env 保存，回车沿用，或输入新值）"
   fi
   printf "  输入代理地址（构建/运行出站用）[%s]: " "$PROXY"
-  read_line NEW_PROXY
+  read_line NEW_PROXY || return 1
   if [ -n "$NEW_PROXY" ]; then
     PROXY="$(normalize_proxy "$NEW_PROXY")"
   fi
   if [ "$PROXY" != "$SAVED_PROXY" ]; then
-    env_upsert DSH_PROXY "$PROXY"
+    env_upsert DSH_PROXY "$PROXY" || return 1
     ok "代理已写入 $ENV_FILE：DSH_PROXY=$PROXY"
   fi
 
@@ -638,13 +780,13 @@ run_setup_wizard() {
   MODE_SEL=1
   # ---------- 域名 + Authelia ----------
     printf "  输入根域（如 example.com，不要带 http://）: "
-    read_line ROOT
+    read_line ROOT || return 1
     ROOT="${ROOT#http://}"; ROOT="${ROOT#https://}"
     case "$ROOT" in
       ""|*" "*|*"/"*|*":"*) fail "无效根域: $ROOT（应为 example.com 形式，不带端口/路径）"; return 1 ;;
     esac
     printf "  Let's Encrypt 证书邮箱 [默认 admin@%s]: " "$ROOT"
-    read_line EMAIL
+    read_line EMAIL || return 1
     [ -z "$EMAIL" ] && EMAIL="admin@$ROOT"
     case "$EMAIL" in
       ""|*" "*) fail "无效邮箱: $EMAIL"; return 1 ;;
@@ -656,7 +798,7 @@ run_setup_wizard() {
     echo "    2) Caddy 直连 80/443（80 用于 HTTP→HTTPS 跳转/ACME HTTP-01）"
     echo "    3) lucky / CF Tunnel 等前置反代（公网 TLS 终结，Caddy 只监听内部端口）"
     printf "  请输入 1、2 或 3 [1]: "
-    read_line ENTRY_SEL
+    read_line ENTRY_SEL || return 1
     [ -z "$ENTRY_SEL" ] && ENTRY_SEL=1
     case "$ENTRY_SEL" in
       1) ENTRY_MODE="$MODE_DIRECT_443_ONLY" ;;
@@ -665,7 +807,7 @@ run_setup_wizard() {
         ENTRY_MODE="$MODE_FRONT_PROXY"
         # 公网 HTTPS 端口 = lucky/CF 反代监听的端口（浏览器访问时带 :端口）
         printf "  公网 HTTPS 端口（lucky/CF 监听端口，浏览器访问用）[443]: "
-        read_line NEW_PUBLIC_PORT
+        read_line NEW_PUBLIC_PORT || return 1
         if [ -n "$NEW_PUBLIC_PORT" ]; then
           case "$NEW_PUBLIC_PORT" in
             *[!0-9]*) fail "无效端口: $NEW_PUBLIC_PORT（应为 1-65535 的数字）"; return 1 ;;
@@ -727,13 +869,13 @@ run_setup_wizard() {
       else
         printf "  输入新的 admin 登录密码（不回显；直接回车 = 保留现有密码）: "
       fi
-      read_secret PW1
+      read_secret PW1 || return 1
       if [ -z "$PW1" ] && [ "$PW_PLACEHOLDER" -eq 1 ]; then
         fail "密码不能为空"; return 1
       fi
       if [ -n "$PW1" ]; then
         printf "  再次输入确认: "
-        read_secret PW2
+        read_secret PW2 || return 1
         if [ "$PW1" != "$PW2" ]; then fail "两次密码不一致"; return 1; fi
         echo "  正在生成 argon2id 哈希（首次需拉取 authelia 镜像，请稍候）..."
         AUTH_HASH=$(authelia_hash "$PW1")
@@ -891,7 +1033,7 @@ fi
 
 # ---------- 必要文件 ----------
 section "2. 文件完整性"
-for f in Dockerfile entrypoint.sh docker-compose.yml \
+for f in Dockerfile entrypoint.sh patch-trusted-domain.mjs docker-compose.yml \
           caddy/Caddyfile authelia/configuration.yml authelia/users_database.yml; do
   if [ -f "$SCRIPT_DIR/$f" ]; then ok "$f"; else fail "$f 缺失"; fi
 done
@@ -899,7 +1041,7 @@ done
 # ---------- 配置向导（检测到占位符时自动交互配置） ----------
 section "3. 配置向导"
 if [ "$UPGRADE_MODE" -eq 1 ]; then
-  ok "升级模式：跳过配置向导（Caddy/Authelia 配置保持不变）"
+  ok "升级模式：跳过 Caddy/Authelia 配置向导（dsh patch 仍会单独询问）"
   backup_upgrade_configs || {
     fail "无法创建升级前配置快照；为保护版本和 Caddy/Authelia，停止升级"
     exit 1
@@ -922,7 +1064,6 @@ if [ "$UPGRADE_MODE" -eq 1 ]; then
     fi
     if ! update_dsh_version_atomic "$LATEST_V"; then
       fail "无法原子更新 Dockerfile 的 DSH_VERSION"
-      restore_upgrade_version
       exit 1
     fi
     if [ "$OLD_V" = "$LATEST_V" ]; then
@@ -932,11 +1073,30 @@ if [ "$UPGRADE_MODE" -eq 1 ]; then
     fi
   fi
 else
-  run_setup_wizard
+  run_setup_wizard || exit 1
+fi
+
+# 首次部署/--setup 与 --upgrade/--latest 都独立询问 patch；升级时必须在
+# backup_upgrade_configs() 之后进行，这样 .env 的最早快照已经就绪，可以安全回滚。
+ACTIVE_CADDY=$(sed '/^[[:space:]]*#/d' "$CADDYFILE")
+CURRENT_DSH_HOST=""
+CURRENT_DSH_HOST=$(printf '%s\n' "$ACTIVE_CADDY" \
+  | grep -oE '^(https?://)dsh\.[^ {]+' \
+  | head -n 1 \
+  | sed -E 's#^https?://##; s#:[0-9]+$##')
+if [ "$UPGRADE_MODE" -eq 1 ] || [ "$SETUP_WIZARD_RAN" -eq 1 ]; then
+  configure_trusted_domain "$SAVED_TRUSTED_DOMAIN" "$CURRENT_DSH_HOST" || exit 1
+  if [ "$DSH_TRUSTED_DOMAIN_CHANGED" -eq 1 ] && [ "$SKIP_BUILD" -eq 1 ]; then
+    fail "DSH_TRUSTED_DOMAIN 已改变，但 --skip-build 不会重建镜像；请去掉 --skip-build"
+    exit 1
+  fi
+  persist_trusted_domain || {
+    fail "无法保存 DSH_TRUSTED_DOMAIN 到 $ENV_FILE"
+    exit 1
+  }
 fi
 
 # Basic Auth 已删除：过滤注释后，发现旧的裸端口站点或 basic_auth 指令时直接要求迁移。
-ACTIVE_CADDY=$(sed '/^[[:space:]]*#/d' "$CADDYFILE")
 if printf '%s\n' "$ACTIVE_CADDY" | grep -qE '(^|[[:space:]])(:[0-9]+|basic_auth|basicauth)([[:space:]]|\{|$)'; then
   fail "检测到已删除的 Basic Auth/裸端口 Caddy 配置（$CADDYFILE）；请先保留备份，再运行 ./deploy.sh --setup 迁移到域名 + Authelia 或前置反代/Tunnel。旧 Basic Auth 密码不会自动迁移。"
   exit 1
@@ -1295,8 +1455,11 @@ if [ "$SKIP_BUILD" -eq 1 ]; then
     echo "  ${C_R}Compose 启动失败，进入统一失败处理。${C_0}"
   fi
 else
-  echo "  构建镜像（首次约 10 分钟，native 依赖编译；npm 走代理 $PROXY）..."
-  if $COMPOSE build --build-arg "HTTP_PROXY=$PROXY" --build-arg "HTTPS_PROXY=$PROXY"; then
+  echo "  构建镜像（首次约 10 分钟，native 依赖编译；npm 走代理 $PROXY；DSH patch=${DSH_TRUSTED_DOMAIN:-关闭}）..."
+  if $COMPOSE build \
+       --build-arg "HTTP_PROXY=$PROXY" \
+       --build-arg "HTTPS_PROXY=$PROXY" \
+       --build-arg "DSH_TRUSTED_DOMAIN=$DSH_TRUSTED_DOMAIN"; then
     ok "构建完成"
   else
     echo "${C_R}构建失败。${C_0}"

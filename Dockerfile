@@ -17,7 +17,7 @@
 # ---------- 构建阶段：装编译工具链 + 安装 dsh ----------
 FROM node:22-bookworm AS build
 
-ARG DSH_VERSION=0.1.0-rc.7
+ARG DSH_VERSION=0.1.0-rc.8
 
 # node-gyp 编译工具链 + CA 证书（编译一次约 10 分钟，正常现象）
 # apt 与 npm 都使用构建时注入的 HTTP_PROXY/HTTPS_PROXY（--build-arg）。
@@ -36,6 +36,9 @@ FROM node:22-bookworm
 # 因此运行镜像不再内置 Docker CLI/Compose，也不挂载 docker.sock。
 
 ARG PNPM_VERSION=11.20.0
+# 可选：把一个由 HTTPS + Authelia 保护的反向代理 hostname 纳入 DSH 的
+# loopback-only 浏览器权限面。只接受纯 hostname，不含协议、端口或路径。
+ARG DSH_TRUSTED_DOMAIN=""
 
 # tini（PID 1 init）+ git（git 源插件）+ CA 证书（同样走构建代理）
 RUN apt-get update \
@@ -43,6 +46,16 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /usr/local/lib/node_modules /usr/local/lib/node_modules
+
+# rc8+ 把 settings/credentials/directory-picker 等特权 RPC 固定为 loopback-only。
+# 运行容器以 node(1000) 启动，无权改 /usr/local/lib/node_modules；因此可选 patch
+# 必须在此处以构建用户 root 应用，并同时修改浏览器 bundle 与 Host API 栅栏。
+COPY patch-trusted-domain.mjs /tmp/patch-trusted-domain.mjs
+RUN if [ -n "$DSH_TRUSTED_DOMAIN" ]; then \
+      node /tmp/patch-trusted-domain.mjs "$DSH_TRUSTED_DOMAIN"; \
+    fi \
+ && rm -f /tmp/patch-trusted-domain.mjs
+
 # pnpm 固定版本：`dsh plugin` 运行时管理社区插件依赖它（转发 pnpm 命令），
 # 固定版本保证 lockfile 与插件安装行为稳定；升级时改 ARG 重建。
 # npm 全局 bin 是符号链接，跨阶段 COPY 行为不确定，dsh 的 bin 显式重建。

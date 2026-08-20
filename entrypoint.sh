@@ -10,6 +10,8 @@
 #    deploy.sh 启动后会验证实际绑定地址。
 # 3) 可选：DSH_TRUSTED_HOSTS 追加 --trusted-host（默认方案由 Caddy 改写
 #    Host 头绕过信任栅栏，不需要；仅在直连 3080 或透传真实 Host 时才需要）。
+# 4) rc8+ 的反向代理 trusted-domain 兼容 patch 在 Dockerfile 构建阶段应用；
+#    运行容器保持 node(1000)，不修改 /usr/local/lib/node_modules。
 set -e
 
 export NODE_USE_ENV_PROXY=1

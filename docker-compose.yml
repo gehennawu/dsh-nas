@@ -25,6 +25,11 @@ services:
   dsh:
     build:
       context: .
+      args:
+        # 只填纯 hostname；浏览器 URL 的协议、端口和路径不参与 hostname 判定。
+        # 示例：https://dsh.example.com:16666 → dsh.example.com
+        DSH_TRUSTED_DOMAIN: ${DSH_TRUSTED_DOMAIN:-}
+    # DSH_TRUSTED_DOMAIN 是镜像构建参数；修改后必须重新 build，restart 不会生效。
     image: dsh:local
     container_name: dsh
     network_mode: host        # 直通宿主的代理端口；dsh 绑定 127.0.0.1（entrypoint.sh）
