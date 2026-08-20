@@ -3,7 +3,7 @@
 # dsh-nas Linux NAS 一键部署脚本
 # 检查：环境 / 文件完整性 / 密钥与域名占位符 / 数据目录权限
 #       / 端口冲突 / 代理连通性，然后构建并启动、等待健康，
-#       最后验证 dsh 仅监听回环（host 网络下的安全前提）。
+#       最后验证 dsh 仅监听回环；全部通过后清理 dangling 旧镜像（host 网络下的安全前提）。
 # 用法:
 #   ./deploy.sh                     # 完整检查 + 构建 + 启动
 #   ./deploy.sh --skip-build        # 跳过构建，直接用现有镜像启动
@@ -431,6 +431,30 @@ wait_for_stack_healthy() {
   echo "  ${C_R}回滚健康状态: dsh=${status:-unknown}, authelia=${authelia_status:-unknown}, caddy=${caddy_status:-unknown}${C_0}"
   return 1
 }
+
+# Docker 的 dangling 镜像是没有标签且没有容器引用的镜像。
+# `image prune` 由 Docker 根据引用关系决定可删除对象；这里只清理 dangling，
+# 不使用 -a，避免误删仍有标签但暂时未运行的镜像。
+# 清理失败只产生警告，不影响已经通过健康检查的部署结果。
+cleanup_dangling_images() {
+  local before after removed
+  before=$(docker image ls --filter dangling=true --quiet 2>/dev/null \
+    | sort -u \
+    | awk 'NF { count++ } END { print count + 0 }')
+
+  if ! docker image prune --force >/dev/null 2>&1; then
+    warn "悬空镜像清理失败，已跳过（不影响已通过健康检查的服务）"
+    return 0
+  fi
+
+  after=$(docker image ls --filter dangling=true --quiet 2>/dev/null \
+    | sort -u \
+    | awk 'NF { count++ } END { print count + 0 }')
+  removed=$((before - after))
+  [ "$removed" -lt 0 ] && removed=0
+  ok "悬空镜像（dangling）清理完成：移除 $removed 个无引用镜像"
+}
+
 upgrade_stack_changed() {
   local current running
   if [ "$UPGRADE_OLD_DSH_EXISTS" -eq 1 ]; then
@@ -1568,6 +1592,14 @@ if [ "$FAIL" -gt 0 ] || [ "$UP_OK" -ne 1 ]; then
   compose_down_current || true
 fi
 
+if [ "$FAIL" -eq 0 ] && [ "$UP_OK" -eq 1 ]; then
+  # 健康检查和 listener 安全验证均通过后，提交升级事务，再清理旧镜像。
+  # prune 可能删除旧 dangling dsh 镜像，因此之后不再尝试回滚。
+  UPGRADE_COMMITTED=1
+  UPGRADE_ROLLBACK_ARMED=0
+  cleanup_dangling_images
+fi
+
 # ---------- 总结 ----------
 section "结果"
 echo "  ${C_B}$PASS 项通过 | $WARN 项警告 | $FAIL 项失败${C_0}"
@@ -1586,6 +1618,4 @@ if [ "$FAIL" -gt 0 ] || [ "$UP_OK" -ne 1 ]; then
   echo "  ${C_R}部署流程结束，但有检查或启动失败；退出码置为 1，修复后重跑: $0${C_0}"
   exit 1
 fi
-UPGRADE_COMMITTED=1
-UPGRADE_ROLLBACK_ARMED=0
 exit 0

@@ -148,7 +148,7 @@ chmod +x deploy.sh
 4. 自动生成 Authelia 密钥、用户密码哈希和 Caddyfile（被改写文件备份 `.bak`）；
 5. 询问是否启用 DSH 反代域名 patch；启用时将 hostname 保存到 `.env`，构建阶段以 root patch DSH bundle；不启用则保持原始 loopback-only 行为；
 6. 检查文件、目录、端口、代理连通性；
-7. 构建并启动，等待健康检查并校验 listener。
+7. 构建并启动，等待健康检查并校验 listener；全部通过后按 Docker 引用关系清理 dangling 旧镜像。
 
 ## 升级
 
