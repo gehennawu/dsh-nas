@@ -2,8 +2,10 @@
 # ============================================================
 # dsh-nas Linux NAS 一键部署脚本
 # 检查：环境 / 文件完整性 / 密钥与域名占位符 / 数据目录权限
-#       / 端口冲突 / 代理连通性，然后构建并启动、等待健康，
-#       最后验证 dsh 仅监听回环；全部通过后清理 dangling 旧镜像（host 网络下的安全前提）。
+#       / 端口冲突 / 代理连通性；进入构建阶段前交互选择 dsh 版本
+#       （Dockerfile 锁定 / npm latest 正式版 / npm next 预览版，写回 Dockerfile），
+#       然后构建并启动、等待健康，最后验证 dsh 仅监听回环；
+#       全部通过后清理 dangling 旧镜像（host 网络下的安全前提）。
 # 用法:
 #   ./deploy.sh                     # 完整检查 + 构建 + 启动
 #   ./deploy.sh --skip-build        # 跳过构建，直接用现有镜像启动
@@ -89,6 +91,10 @@ usage() {
   echo "  --upgrade           升级模式：跳过 Caddy/Authelia 向导，但仍询问是否启用/更新 dsh 域名 patch"
   echo "  --latest            自动升级到 npm 最新版：查询 @deepseek-ai/dsh latest，更新版本号后"
   echo "                      构建（隐含 --upgrade；需已完成一次正常部署；仍询问 patch）"
+  echo ""
+  echo "交互构建前会询问要安装的 dsh 版本：Dockerfile 锁定版（默认）/ npm latest"
+  echo "正式版 / npm next 预览版，选择后写入 Dockerfile；--skip-build 不构建不询问，"
+  echo "--latest 已自动选定 latest 不再询问"
 }
 
 while [ $# -gt 0 ]; do
@@ -268,9 +274,12 @@ atomic_replace_file() { # $1=temporary file $2=target file
   dir=$(dirname "$target")
   sync -d "$dir" 2>/dev/null || true
 }
+valid_dsh_version() { # $1=版本号（semver + 预发布段，与 Dockerfile 唯一版本来源一致）
+  [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$ ]]
+}
 update_dsh_version_atomic() { # $1=validated version
   local version="$1" file="$SCRIPT_DIR/Dockerfile" tmp count
-  [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$ ]] || return 1
+  valid_dsh_version "$version" || return 1
   count=$(grep -cE '^ARG DSH_VERSION=' "$file" 2>/dev/null || true)
   [ "$count" -eq 1 ] || return 1
   tmp=$(mktemp "${file}.tmp.XXXXXX") || return 1
@@ -280,6 +289,127 @@ update_dsh_version_atomic() { # $1=validated version
     rm -f "$tmp"
     return 1
   fi
+}
+
+# ---------- 构建前 dsh 版本选择 ----------
+# npm dist-tags：latest = 正式版，next = 预览版（dist-tags 端点一次返回两者，体积远小于完整元数据）。
+npm_dist_tag_version() { # $1=dist-tags JSON $2=tag 名
+  printf '%s' "$1" | grep -o "\"$2\": *\"[^\"]*\"" | head -n 1 | cut -d'"' -f4
+}
+
+# no-cache GET：curl/wget 自身不缓存，但中间层（转发代理上游、CDN、镜像缓存）可能按 URL
+# 缓存响应。版本号查询命中旧缓存会显示/安装过期版本，因此双保险穿透：
+#   1) 每次请求追加唯一时间戳参数（date+PID+RANDOM）→ URL 每次不同，
+#      按 URL 键控的缓存必然未命中；
+#   2) Cache-Control: no-cache / Pragma: no-cache 请求头 → 要求遵守 HTTP 语义的
+#      缓存层重新向上游验证。
+http_get_nocache() { # $1=超时秒 $2=url [$3=代理URL]
+  local timeout="$1" url="$2" proxy="${3:-}" sep nc
+  case "$url" in
+    *\?*) sep="&" ;;
+    *)    sep="?" ;;
+  esac
+  nc="$(date +%s)-$$-${RANDOM}"
+  url="${url}${sep}_nc=${nc}"
+  if command -v curl >/dev/null 2>&1; then
+    if [ -n "$proxy" ]; then
+      curl -s -m "$timeout" -x "$proxy" \
+        -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' "$url"
+    else
+      curl -s -m "$timeout" \
+        -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' "$url"
+    fi
+  elif command -v wget >/dev/null 2>&1; then
+    # wget 不认 -x；代理经 https_proxy/http_proxy 环境变量传入
+    if [ -n "$proxy" ]; then
+      https_proxy="$proxy" http_proxy="$proxy" \
+        wget -qO- -T "$timeout" \
+          --header='Cache-Control: no-cache' --header='Pragma: no-cache' "$url"
+    else
+      wget -qO- -T "$timeout" \
+        --header='Cache-Control: no-cache' --header='Pragma: no-cache' "$url"
+    fi
+  else
+    return 1
+  fi
+}
+
+# npm dist-tags 统一入口：直连优先，失败走代理；两次尝试各自独立穿透缓存。
+npm_fetch_dist_tags() { # stdout: dist-tags JSON（失败输出空）
+  local reg_base="https://registry.npmjs.org/-/package/@deepseek-ai/dsh/dist-tags" out=""
+  out=$(http_get_nocache 10 "$reg_base") || out=""
+  [ -n "$out" ] || { out=$(http_get_nocache 15 "$reg_base" "$PROXY") || out=""; }
+  printf '%s' "$out"
+}
+
+# 进入构建阶段前交互确认要安装的 dsh 版本：
+#   1) Dockerfile 当前锁定版本（默认）  2) npm latest 正式版  3) npm next 预览版
+# 选 2/3 时把版本号原子写回 Dockerfile 再构建。
+# - --latest 已在前面的升级流程自动写入 latest，这里不再询问（保持无人值守语义）；
+# - --skip-build 不构建，调用方不触发本函数；
+# - 非 TTY 或 registry 不可达时降级为保持 Dockerfile 锁定版本（只警告，不阻断）；
+# - 升级模式下本函数运行在 backup_upgrade_configs() 之后，选择新版本后若构建/健康失败，
+#   EXIT trap 仍会恢复快照中的旧版本号，回滚语义不变。
+select_dsh_version() {
+  local dockerfile_v latest_v="" next_v="" tags_json="" answer version
+  dockerfile_v=$(sed -n 's/^ARG DSH_VERSION=//p' "$SCRIPT_DIR/Dockerfile" | head -n 1)
+  if ! valid_dsh_version "$dockerfile_v"; then
+    fail "无法从 Dockerfile 读取有效的 DSH_VERSION: ${dockerfile_v:-（缺失）}"
+    return 1
+  fi
+  [ "$LATEST_MODE" -eq 1 ] && return 0
+
+  echo
+  echo "  正在查询 @deepseek-ai/dsh 的 npm 版本号（latest 正式版 / next 预览版；每次强制穿透缓存）..."
+  tags_json=$(npm_fetch_dist_tags)
+  if [ -z "$tags_json" ]; then
+    warn "npm registry 直连与代理 $PROXY 均不可达；本次按 Dockerfile 锁定版本 $dockerfile_v 构建"
+    return 0
+  fi
+  latest_v=$(npm_dist_tag_version "$tags_json" latest)
+  if ! valid_dsh_version "$latest_v"; then
+    latest_v=""
+    warn "npm dist-tags 未返回有效的 latest 正式版"
+  fi
+  next_v=$(npm_dist_tag_version "$tags_json" next)
+  if ! valid_dsh_version "$next_v"; then
+    next_v=""
+    warn "npm dist-tags 未返回有效的 next 预览版"
+  fi
+  if [ -z "$latest_v" ] && [ -z "$next_v" ]; then
+    warn "npm dist-tags 无可用版本号；本次按 Dockerfile 锁定版本 $dockerfile_v 构建"
+    return 0
+  fi
+  if [ ! -t 0 ]; then
+    echo "  非交互环境：跳过版本选择，按 Dockerfile 锁定版本 $dockerfile_v 构建（npm latest=${latest_v:-不可用} next=${next_v:-不可用}）"
+    return 0
+  fi
+
+  echo "  选择要安装的 dsh 版本（选择后写入 Dockerfile 的 ARG DSH_VERSION 再构建）："
+  echo "    1) Dockerfile 锁定版本: $dockerfile_v（默认，回车保持）"
+  [ -n "$latest_v" ] && echo "    2) npm 正式版 (latest): $latest_v"
+  [ -n "$next_v" ] && echo "    3) npm 预览版 (next):   $next_v"
+  printf "  请选择 [1]: "
+  read_line answer || return 1
+  [ -z "$answer" ] && answer=1
+  case "$answer" in
+    1) version="$dockerfile_v" ;;
+    2)
+      [ -n "$latest_v" ] || { fail "npm 正式版 (latest) 不可用，无法选择 2"; return 1; }
+      version="$latest_v" ;;
+    3)
+      [ -n "$next_v" ] || { fail "npm 预览版 (next) 不可用，无法选择 3"; return 1; }
+      version="$next_v" ;;
+    *) fail "无效选项: $answer（应为 1、2 或 3）"; return 1 ;;
+  esac
+
+  if [ "$version" = "$dockerfile_v" ]; then
+    ok "保持 Dockerfile 锁定版本: $dockerfile_v"
+    return 0
+  fi
+  update_dsh_version_atomic "$version" || { fail "无法原子更新 Dockerfile 的 DSH_VERSION"; return 1; }
+  ok "dsh 版本已更新: $dockerfile_v → $version"
+  return 0
 }
 
 # 升级模式只允许改版本并构建 dsh；配置文件由调用方完整保留。
@@ -453,6 +583,88 @@ cleanup_dangling_images() {
   removed=$((before - after))
   [ "$removed" -lt 0 ] && removed=0
   ok "悬空镜像（dangling）清理完成：移除 $removed 个无引用镜像"
+}
+
+# ---------- 构建产物核验（patch 可见性） ----------
+# patch 在 Dockerfile 的 RUN 步骤内以 root 执行，BuildKit 的 TTY 进度 UI 会折叠 RUN 输出，
+# 部署过程因此看不到 patch 脚本自己的打印。这里在构建后直接进入镜像实测并把结论打印进
+# 部署日志（不依赖构建日志的展示方式）：
+#   1) 两个 dsh-client-connection bundle 的 patch 标记与反代域名是否真的写入；
+#   2) 镜像内安装的 dsh 版本是否与 Dockerfile 锁定一致（版本选择是否真正生效）。
+# 逐行查看 patch 脚本原始输出可运行: BUILDKIT_PROGRESS=plain docker compose build dsh
+verify_dsh_image() { # $1=阶段标签（如 "构建后" / "--skip-build "）
+  local stage="$1" image="dsh:local" domain="${DSH_TRUSTED_DOMAIN:-}" probe
+  local dockerfile_v image_v client_state index_state client_dom index_dom line rest
+  dockerfile_v=$(sed -n 's/^ARG DSH_VERSION=//p' "$SCRIPT_DIR/Dockerfile" | head -n 1)
+  if ! docker image inspect "$image" >/dev/null 2>&1; then
+    fail "镜像 $image 不存在（${stage}核验）"
+    return 1
+  fi
+  probe=$(docker run --rm --entrypoint node "$image" -e '
+    const fs = require("node:fs");
+    const domain = process.argv[1] || "";
+    const pkg = "/usr/local/lib/node_modules/@deepseek-ai/dsh/package.json";
+    const files = {
+      "client.js": "/usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-client-connection/lib/client.js",
+      "index.js": "/usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-client-connection/lib/index.js",
+    };
+    const marker = "dsh-nas: trusted-domain patch";
+    console.log("version=" + JSON.parse(fs.readFileSync(pkg, "utf8")).version);
+    for (const [name, file] of Object.entries(files)) {
+      let src;
+      try {
+        src = fs.readFileSync(file, "utf8");
+      } catch {
+        console.log(name + "=missing,no-file");
+        continue;
+      }
+      if (!src.includes(marker)) {
+        console.log(name + "=original,no-marker");
+      } else {
+        console.log(name + "=patched," + (src.includes(JSON.stringify(domain)) ? "domain-ok" : "domain-missing"));
+      }
+    }
+  ' "$domain" 2>/dev/null) || { fail "无法在镜像 $image 内执行核验（docker run 失败）"; return 1; }
+
+  image_v=""; client_state=""; index_state=""; client_dom=""; index_dom=""
+  while IFS= read -r line; do
+    case "$line" in
+      version=*)
+        image_v="${line#version=}" ;;
+      client.js=*)
+        rest="${line#client.js=}"; client_state="${rest%%,*}"; client_dom="${rest#*,}" ;;
+      index.js=*)
+        rest="${line#index.js=}"; index_state="${rest%%,*}"; index_dom="${rest#*,}" ;;
+    esac
+  done <<< "$probe"
+
+  if [ -z "$image_v" ]; then
+    fail "无法从镜像 $image 读取 dsh 版本（${stage}核验）"
+    return 1
+  fi
+  if [ "$image_v" = "$dockerfile_v" ]; then
+    ok "镜像内 dsh 版本: $image_v（${stage}实测，与 Dockerfile 锁定一致）"
+  else
+    fail "镜像内 dsh 版本 $image_v 与 Dockerfile 锁定 $dockerfile_v 不一致（${stage}实测）"
+    return 1
+  fi
+
+  if [ -n "$domain" ]; then
+    if [ "$client_state" = "patched" ] && [ "$index_state" = "patched" ] \
+       && [ "$client_dom" = "domain-ok" ] && [ "$index_dom" = "domain-ok" ]; then
+      ok "DSH patch 已生效（${stage}实测）: client.js + index.js 均接受反代域名 $domain"
+      return 0
+    fi
+    fail "DSH patch 核验未通过（${stage}实测，期望两个 bundle 均接受 $domain）: client.js=${client_state:-?}/${client_dom:-?} index.js=${index_state:-?}/${index_dom:-?}"
+    return 1
+  else
+    if [ "$client_state" = "original" ] && [ "$index_state" = "original" ]; then
+      ok "DSH patch 未启用（${stage}实测）: client.js + index.js 保持原始 loopback-only 行为"
+      return 0
+    fi
+    fail "DSH patch 核验异常（${stage}实测，.env 未启用 patch 但镜像内发现 patch 标记）: client.js=${client_state:-?} index.js=${index_state:-?}"
+    return 1
+  fi
 }
 
 upgrade_stack_changed() {
@@ -1070,13 +1282,12 @@ if [ "$UPGRADE_MODE" -eq 1 ]; then
     fail "无法创建升级前配置快照；为保护版本和 Caddy/Authelia，停止升级"
     exit 1
   }
-  # --latest：从 npm registry 取 @deepseek-ai/dsh 最新版写入版本文件（与网页端升级同一数据源）
+  # --latest：从 npm registry 取 @deepseek-ai/dsh 最新版写入版本文件（与网页端升级同一数据源；
+  # 同样经 npm_fetch_dist_tags 穿透缓存，避免拿到过期的 latest）
   if [ "$LATEST_MODE" -eq 1 ]; then
-    REG_URL="https://registry.npmjs.org/@deepseek-ai%2fdsh/latest"
-    LATEST_JSON=$(http_get 10 "$REG_URL")
-    [ -z "$LATEST_JSON" ] && LATEST_JSON=$(http_get 15 "$REG_URL" "$PROXY")
-    LATEST_V=$(printf '%s' "$LATEST_JSON" | grep -o '"version": *"[^"]*"' | head -n 1 | cut -d'"' -f4)
-    if ! [[ "$LATEST_V" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$ ]]; then
+    LATEST_JSON=$(npm_fetch_dist_tags)
+    LATEST_V=$(npm_dist_tag_version "$LATEST_JSON" latest)
+    if ! valid_dsh_version "$LATEST_V"; then
       fail "获取 npm 最新版本失败（registry 直连与代理均不可达，或返回异常）"
       echo "  可手动改 Dockerfile 的 DSH_VERSION 后，不带 --latest 重跑"
       exit 1
@@ -1475,16 +1686,31 @@ compose_down_current() {
 UP_OK=0
 if [ "$SKIP_BUILD" -eq 1 ]; then
   ok "跳过构建，直接启动"
+  # 即使不构建也核验现有镜像：patch 状态与版本必须与当前配置一致，否则反代域名 RPC 会静默失败
+  if ! verify_dsh_image "--skip-build "; then
+    echo "  ${C_R}现有 dsh:local 镜像与当前配置不一致，拒绝以此镜像启动；请去掉 --skip-build 重新构建。${C_0}"
+    exit 1
+  fi
   if ! compose_up; then
     echo "  ${C_R}Compose 启动失败，进入统一失败处理。${C_0}"
   fi
 else
+  # 构建前交互确认 dsh 版本（Dockerfile 锁定 / npm latest 正式版 / npm next 预览版），写回 Dockerfile
+  if ! select_dsh_version; then
+    echo "${C_R}版本选择失败，中止构建。${C_0}"
+    exit 1
+  fi
   echo "  构建镜像（首次约 10 分钟，native 依赖编译；npm 走代理 $PROXY；DSH patch=${DSH_TRUSTED_DOMAIN:-关闭}）..."
+  echo "  （patch 在构建 RUN 步骤内执行，BuildKit 进度 UI 会折叠其输出；构建完成后脚本会进入镜像实测 patch 与版本）"
   if $COMPOSE build \
        --build-arg "HTTP_PROXY=$PROXY" \
        --build-arg "HTTPS_PROXY=$PROXY" \
        --build-arg "DSH_TRUSTED_DOMAIN=$DSH_TRUSTED_DOMAIN"; then
     ok "构建完成"
+    if ! verify_dsh_image "构建后"; then
+      echo "${C_R}构建产物核验失败，镜像与配置不符；中止启动。${C_0}"
+      exit 1
+    fi
   else
     echo "${C_R}构建失败。${C_0}"
     echo "  ${C_Y}常见原因与处理：${C_0}"

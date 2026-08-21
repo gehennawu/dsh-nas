@@ -148,17 +148,18 @@ chmod +x deploy.sh
 4. 自动生成 Authelia 密钥、用户密码哈希和 Caddyfile（被改写文件备份 `.bak`）；
 5. 询问是否启用 DSH 反代域名 patch；启用时将 hostname 保存到 `.env`，构建阶段以 root patch DSH bundle；不启用则保持原始 loopback-only 行为；
 6. 检查文件、目录、端口、代理连通性；
-7. 构建并启动，等待健康检查并校验 listener；全部通过后按 Docker 引用关系清理 dangling 旧镜像。
+7. 构建前交互选择 dsh 版本：展示 Dockerfile 锁定版、npm `latest` 正式版、npm `next` 预览版三个选项（各带版本号），选择后写回 `Dockerfile` 的 `ARG DSH_VERSION`；回车默认保持锁定版，非交互或 registry 不可达时自动按锁定版继续；
+8. 构建并启动，等待健康检查并校验 listener；全部通过后按 Docker 引用关系清理 dangling 旧镜像。
 
 ## 升级
 
 ```sh
-sudo ./deploy.sh --upgrade    # 使用 Dockerfile 当前版本重建 dsh
-sudo ./deploy.sh --latest     # 查询 npm latest，更新版本号后重建
+sudo ./deploy.sh --upgrade    # 交互选择 dsh 版本（锁定版/latest/next）后重建
+sudo ./deploy.sh --latest     # 不询问，直接查询 npm latest，更新版本号后重建
 ```
 
 - 升级需 root（事务快照与升级锁在 root-only 的 `/var/lib/dsh-nas-upgrade`）。
-- 跳过 Caddy/Authelia 配置向导，但仍交互询问是否启用/更新 DSH 反代域名 patch；构建前保存配置、`.env`、旧镜像 ID 和容器状态。
+- 跳过 Caddy/Authelia 配置向导，但仍交互询问是否启用/更新 DSH 反代域名 patch；构建前还会交互选择 dsh 版本（`--latest` 则跳过选择，直接用 npm latest）；构建前保存配置、`.env`、旧镜像 ID 和容器状态，版本选择发生在快照之后，失败回滚仍恢复旧版本号。
 - `flock` 防并发；版本文件原子替换。
 - 构建、启动、健康或 listener 校验失败时自动恢复旧版本文件、旧镜像和旧 dsh 服务；恢复失败仍非零退出。这是单机回滚保护，不是蓝绿发布。
 - 运行数据在 `data/`，不会因重建丢失。
@@ -174,9 +175,12 @@ sudo ./deploy.sh --latest     # 查询 npm latest，更新版本号后重建
 ## 构建和版本
 
 - dsh 版本唯一来源是 `Dockerfile` 的 `ARG DSH_VERSION`。
+- 交互部署在构建前从 npm dist-tags 端点拉取 `latest`（正式版）与 `next`（预览版）版本号，连同 Dockerfile 锁定版一起列出供选择（直连失败自动走代理重试）；选定后原子写回 `Dockerfile`。`--skip-build` 不构建故不询问，`--latest` 已自动选定 latest 不再询问。
+- 版本号查询不受缓存影响：脚本不经 npm 本地缓存（纯 HTTP 直读 registry），每次请求追加唯一时间戳参数并携带 `Cache-Control: no-cache` 请求头，穿透转发代理/CDN 等中间层可能按 URL 缓存的旧响应。
 - 构建阶段的 apt/npm 下载走部署脚本传入的代理；构建容器内 `127.0.0.1` 不是宿主机，代理须填 NAS 局域网地址。
 - 运行时代理来自 `.env` 的 `DSH_PROXY`；`NO_PROXY` 至少含 `127.0.0.1,localhost`。
 - 可选的 `.env` 键 `DSH_TRUSTED_DOMAIN` 只接受纯 hostname（如 `dsh.example.com`），不含协议、端口或路径；非空时 Dockerfile 在 root 构建阶段 patch DSH 的浏览器与 Host API loopback 判定。修改此值必须重新构建 dsh 镜像；执行 `--upgrade`/`--latest` 时脚本会再次询问并保留或修改选择。
+- patch 过程可见性：patch 在构建的 RUN 步骤内执行，BuildKit 进度 UI 会折叠其输出；构建完成后（以及 `--skip-build` 启动前）脚本会进入镜像实测核验并在部署日志打印结论——两个 bundle 是否接受反代域名、镜像内 dsh 版本是否与 Dockerfile 锁定一致，不一致则拒绝启动。需逐行查看 patch 原始输出可运行 `BUILDKIT_PROGRESS=plain docker compose build dsh`。
 - 首次构建需编译 native 依赖，耗时取决于 NAS CPU 和代理速度。
 - `.dockerignore` 保证构建上下文不含运行数据、密钥和部署脚本；构建还需要 `patch-trusted-domain.mjs`。
 
