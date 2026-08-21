@@ -15,8 +15,21 @@
 set -e
 
 export NODE_USE_ENV_PROXY=1
-export HTTP_PROXY="${HTTP_PROXY:-http://127.0.0.1:7890}"
-export HTTPS_PROXY="${HTTPS_PROXY:-http://127.0.0.1:7890}"
+# 代理变量语义（与 docker-compose.yml 的 "-" 插值配合）：
+#   - 未设置 → 回落默认代理 127.0.0.1:7890（裸 docker run 兼容旧行为）
+#   - 设置为空（compose 传入 DSH_PROXY= 空值）→ 显式直连，unset 掉避免
+#     undici 把空字符串当代理 URL 解析失败
+#   - 设置为值 → 原样使用
+if [ "${HTTP_PROXY+set}" != "set" ]; then
+  export HTTP_PROXY="http://127.0.0.1:7890"
+elif [ -z "$HTTP_PROXY" ]; then
+  unset HTTP_PROXY
+fi
+if [ "${HTTPS_PROXY+set}" != "set" ]; then
+  export HTTPS_PROXY="http://127.0.0.1:7890"
+elif [ -z "$HTTPS_PROXY" ]; then
+  unset HTTPS_PROXY
+fi
 export NO_PROXY="${NO_PROXY:-127.0.0.1,localhost}"
 
 # 启动前自检：DSH_HOME 目录必须可写，否则会话/profile 管理等都会 EACCES。

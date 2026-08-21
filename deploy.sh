@@ -19,7 +19,9 @@ USERS_DB="$SCRIPT_DIR/authelia/users_database.yml"
 CADDYFILE="$SCRIPT_DIR/caddy/Caddyfile"
 DATA_DIR="$SCRIPT_DIR/data/dsh"
 WORKSPACE_DIR="$SCRIPT_DIR/data/workspace"
-PROXY="http://127.0.0.1:7890"
+PROXY=""                       # 默认值在参数解析后按探测到的局域网 IP 生成；空值 = 直连
+PROXY_ASKED=0                  # 本次运行是否已确认代理选择（参数/已保存/交互任一即置 1）
+LAN_IP=""                      # 本机出口局域网 IP（构建代理建议值的来源）
 SKIP_BUILD=0
 SETUP_FORCE=0
 SETUP_WIZARD_RAN=0
@@ -86,6 +88,10 @@ usage() {
   echo "  --skip-build        跳过镜像构建，直接用现有镜像"
   echo "  --proxy-host ADDR   代理地址（如 192.168.1.5:7890）；构建与运行时都生效，"
   echo "                      写入 .env 的 DSH_PROXY（compose 自动读取）"
+  echo ""
+  echo "代理选择：Docker 环境检查通过后（以及同意自动安装/升级前）会交互询问是否"
+  echo "使用代理，选择持久化到 .env（DSH_PROXY= 空值表示直连）；--proxy-host 参数"
+  echo "或 .env 已配置时不再询问"
   echo "  --setup             强制重跑配置向导（可换域名/入口/密码；原文件备份为 .bak，Authelia 密钥保留）"
   echo "                      向导还会选择是否启用反代域名 patch，并保存 DSH_TRUSTED_DOMAIN"
   echo "  --upgrade           升级模式：跳过 Caddy/Authelia 向导，但仍询问是否启用/更新 dsh 域名 patch"
@@ -115,6 +121,35 @@ done
 if [ "$UPGRADE_MODE" -eq 1 ] && [ "$SKIP_BUILD" -eq 1 ]; then
   echo "错误: --upgrade/--latest 不能与 --skip-build 同时使用；升级必须重新构建 dsh 镜像"
   exit 1
+fi
+
+# ---------- 默认代理地址：探测本机出口局域网 IP ----------
+# 为什么默认不用 127.0.0.1：构建（docker compose build）的 RUN 步骤在 BuildKit 独立
+# 网络命名空间里执行，容器内的 127.0.0.1 是构建容器自身而非宿主——即使 Clash 就装在
+# NAS 本机，构建阶段也必须用宿主局域网 IP（且代理需允许局域网访问 allow-lan）。
+# 运行时容器是 host 网络，127.0.0.1 与局域网 IP 都可达；单一地址取两者交集 = 局域网 IP。
+detect_lan_ip() {
+  local ip=""
+  # 首选：去 1.1.1.1 的路由源地址 = 真实出口网卡 IP（不受 docker/libvirt 网桥干扰）
+  if command -v ip >/dev/null 2>&1; then
+    ip=$(ip -4 route get 1.1.1.1 2>/dev/null \
+      | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
+  fi
+  # 兜底：hostname -I 过滤回环/CGNAT/docker 网桥/链路本地段后取第一个
+  if [ -z "$ip" ] && command -v hostname >/dev/null 2>&1; then
+    ip=$(hostname -I 2>/dev/null | tr ' ' '\n' \
+      | grep -vE '^(127\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.12[27]\.|169\.254\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.)' \
+      | head -n 1)
+  fi
+  [ -n "$ip" ] && printf '%s' "$ip"
+}
+LAN_IP="$(detect_lan_ip || true)"
+if [ -n "$PROXY" ]; then
+  :   # --proxy-host 已显式指定
+elif [ -n "$LAN_IP" ]; then
+  PROXY="http://${LAN_IP}:7890"
+else
+  PROXY="http://127.0.0.1:7890"   # 探测失败；交互阶段会提示构建可能需要局域网地址
 fi
 
 # ---------- .env 幂等写入（保留其它配置行） ----------
@@ -334,11 +369,13 @@ http_get_nocache() { # $1=超时秒 $2=url [$3=代理URL]
   fi
 }
 
-# npm dist-tags 统一入口：直连优先，失败走代理；两次尝试各自独立穿透缓存。
+# npm dist-tags 统一入口：直连优先，失败走代理（未配置代理时只试直连）；两次尝试各自独立穿透缓存。
 npm_fetch_dist_tags() { # stdout: dist-tags JSON（失败输出空）
   local reg_base="https://registry.npmjs.org/-/package/@deepseek-ai/dsh/dist-tags" out=""
   out=$(http_get_nocache 10 "$reg_base") || out=""
-  [ -n "$out" ] || { out=$(http_get_nocache 15 "$reg_base" "$PROXY") || out=""; }
+  if [ -z "$out" ] && [ -n "$PROXY" ]; then
+    out=$(http_get_nocache 15 "$reg_base" "$PROXY") || out=""
+  fi
   printf '%s' "$out"
 }
 
@@ -363,7 +400,11 @@ select_dsh_version() {
   echo "  正在查询 @deepseek-ai/dsh 的 npm 版本号（latest 正式版 / next 预览版；每次强制穿透缓存）..."
   tags_json=$(npm_fetch_dist_tags)
   if [ -z "$tags_json" ]; then
-    warn "npm registry 直连与代理 $PROXY 均不可达；本次按 Dockerfile 锁定版本 $dockerfile_v 构建"
+    if [ -n "$PROXY" ]; then
+      warn "npm registry 直连与代理 $PROXY 均不可达；本次按 Dockerfile 锁定版本 $dockerfile_v 构建"
+    else
+      warn "npm registry 直连不可达（未配置代理）；本次按 Dockerfile 锁定版本 $dockerfile_v 构建"
+    fi
     return 0
   fi
   latest_v=$(npm_dist_tag_version "$tags_json" latest)
@@ -820,9 +861,17 @@ normalize_proxy() { # $1=addr
 }
 ENV_FILE="$SCRIPT_DIR/.env"
 SAVED_PROXY=""
+SAVED_PROXY_KEY_EXISTS=0
 SAVED_TRUSTED_DOMAIN=""
 TRUSTED_DOMAIN_COUNT=0
 if [ -f "$ENV_FILE" ]; then
+  # DSH_PROXY 键存在但值为空 = 显式选择直连（与键不存在区分开，避免每次重跑都再问一遍）
+  SAVED_PROXY_COUNT=$(grep -c '^DSH_PROXY=' "$ENV_FILE" 2>/dev/null || true)
+  if [ "$SAVED_PROXY_COUNT" -gt 1 ]; then
+    echo "错误: $ENV_FILE 中存在多个 DSH_PROXY，无法安全判断代理配置"
+    exit 1
+  fi
+  [ "$SAVED_PROXY_COUNT" -eq 1 ] && SAVED_PROXY_KEY_EXISTS=1
   SAVED_PROXY=$(sed -n 's/^DSH_PROXY=//p' "$ENV_FILE" | head -n 1)
   TRUSTED_DOMAIN_COUNT=$(grep -c '^DSH_TRUSTED_DOMAIN=' "$ENV_FILE" 2>/dev/null || true)
   if [ "$TRUSTED_DOMAIN_COUNT" -gt 1 ]; then
@@ -851,9 +900,14 @@ if [ "$SET_PROXY_ARG" -eq 1 ]; then
     env_upsert DSH_PROXY "$PROXY" || return 1
     ok "运行时代理已写入 $ENV_FILE：DSH_PROXY=$PROXY"
   fi
-elif [ -n "$SAVED_PROXY" ]; then
-  PROXY="$(normalize_proxy "$SAVED_PROXY")"
-  echo "  沿用 .env 保存的代理: $PROXY（--proxy-host 可覆盖）"
+elif [ "$SAVED_PROXY_KEY_EXISTS" -eq 1 ]; then
+  if [ -n "$SAVED_PROXY" ]; then
+    PROXY="$(normalize_proxy "$SAVED_PROXY")"
+    echo "  沿用 .env 保存的代理: $PROXY（--proxy-host 可覆盖）"
+  else
+    PROXY=""
+    echo "  沿用 .env 保存的代理配置: 不使用代理，直连（--proxy-host 可覆盖）"
+  fi
 fi
 
 # ---------- 升级模式 ----------
@@ -996,21 +1050,9 @@ run_setup_wizard() {
   SETUP_WIZARD_RAN=1
   echo
   echo "  ${C_B}== 配置向导 ==${C_0}（检测到占位配置，将自动写入；原文件备份为 .bak）"
-  # 代理地址（构建 + 运行时统一）。注意：NAS 上构建容器内的 127.0.0.1 是容器自身、
-  # 不是宿主——在 NAS 上构建必须填宿主可达地址（如 http://192.168.1.10:7890），
-  # 并确认 Clash 允许局域网访问（allow-lan）。回车沿用当前值。
-  if [ -n "${SAVED_PROXY:-}" ]; then
-    echo "  当前代理: $PROXY（.env 保存，回车沿用，或输入新值）"
-  fi
-  printf "  输入代理地址（构建/运行出站用）[%s]: " "$PROXY"
-  read_line NEW_PROXY || return 1
-  if [ -n "$NEW_PROXY" ]; then
-    PROXY="$(normalize_proxy "$NEW_PROXY")"
-  fi
-  if [ "$PROXY" != "$SAVED_PROXY" ]; then
-    env_upsert DSH_PROXY "$PROXY" || return 1
-    ok "代理已写入 $ENV_FILE：DSH_PROXY=$PROXY"
-  fi
+  # 代理在环境检查阶段已完成选择/沿用（ensure_proxy_configured；--proxy-host 与 .env 优先），
+  # 此处只提示不重复询问，避免同一次运行问两遍。
+  echo "  代理: ${PROXY:-（直连）}（如需更换: $0 --proxy-host HOST:PORT 或改 .env 的 DSH_PROXY 后重跑）"
 
   echo "  访问方案：域名 + Authelia 双因素（需要可用域名，如 example.com）"
   MODE_SEL=1
@@ -1250,22 +1292,237 @@ EOF
 section "1. 环境检查"
 # ---------- docker / compose ----------
 COMPOSE=""
-if command -v docker >/dev/null 2>&1; then
+# Docker Engine 版本门槛：20.10（Compose V2 插件随 20.10.10+ 分发，compose-spec 的
+# profiles / depends_on condition 依赖 V2；更老的引擎在 Debian/Ubuntu 老版本 NAS 上常见）。
+docker_engine_version_ok() { # $1=docker version --format '{{.Server.Version}}' 输出
+  local v="$1" major minor
+  [[ "$v" =~ ^([0-9]+)\.([0-9]+) ]] || return 1
+  major="${BASH_REMATCH[1]}"; minor="${BASH_REMATCH[2]}"
+  { [ "$major" -gt 20 ] || { [ "$major" -eq 20 ] && [ "$minor" -ge 10 ]; }; }
+}
+# 根权限执行：已 root 直接跑，否则 sudo（代理变量不靠 -E，需要时显式 env 传入）
+run_root() {
+  if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo "$@"; fi
+}
+# 网络相关根命令：先直连，失败自动改走代理重试（apt 在无代理环境可能本来就通）
+root_net_retry() {
+  run_root "$@" && return 0
+  if [ -z "$PROXY" ]; then
+    echo "  直连失败（未配置代理）；如需代理可配置 .env 的 DSH_PROXY 或用 --proxy-host 重跑"
+    return 1
+  fi
+  echo "  直连失败，改走代理 $PROXY 重试..."
+  run_root env http_proxy="$PROXY" https_proxy="$PROXY" "$@"
+}
+# Docker 官方脚本安装/原位升级（Debian/Ubuntu/Fedora 等；脚本会保留现有配置与数据）
+docker_install_official() {
+  local script_url="https://get.docker.com"
+  command -v curl >/dev/null 2>&1 \
+    || { echo "  宿主机没有 curl，无法自动安装；请参考 https://docs.docker.com/engine/install/ 手动处理"; return 1; }
+  if [ -n "$PROXY" ]; then
+    echo "  通过官方脚本安装/升级 Docker（先直连，失败自动改走代理）..."
+    if curl -fsSL "$script_url" | run_root sh; then return 0; fi
+    echo "  直连失败，改走代理 $PROXY 重试..."
+    curl -fsSL -x "$PROXY" "$script_url" \
+      | run_root env http_proxy="$PROXY" https_proxy="$PROXY" sh
+  else
+    echo "  通过官方脚本安装/升级 Docker（直连，未配置代理）..."
+    curl -fsSL "$script_url" | run_root sh
+  fi
+}
+
+# ---------- 代理选择（交互，幂等：每次运行最多问一次） ----------
+# 优先级：--proxy-host 参数 > .env 已保存（DSH_PROXY= 空值也算已选直连）> 交互询问。
+# 询问时机：① 用户同意执行需要联网的安装/升级动作前；② Docker 环境检查通过后
+# （后续 npm 版本查询、镜像构建、dsh 运行时出站都依赖该选择）。
+# 选择立即持久化到 .env；升级模式下此时 .env 早期快照已建立，失败回滚可恢复原值。
+ensure_proxy_configured() {
+  [ "$PROXY_ASKED" -eq 1 ] && return 0
+  if [ "$SET_PROXY_ARG" -eq 1 ] || [ "$SAVED_PROXY_KEY_EXISTS" -eq 1 ]; then
+    PROXY_ASKED=1
+    return 0
+  fi
+  if [ ! -t 0 ]; then
+    PROXY_ASKED=1
+    warn "非交互环境且未配置代理，使用默认值 $PROXY（--proxy-host 参数或 .env 的 DSH_PROXY 可指定；DSH_PROXY= 空值表示直连）"
+    return 0
+  fi
+  local answer addr
+  echo
+  echo "  代理选择（用于 npm 查询/下载、Docker 构建、dsh 运行时出站；国内网络通常需要）"
+  echo "  ${C_Y}注意：构建容器网络独立，127.0.0.1 在构建阶段不可达（是构建容器自身，不是 NAS）。${C_0}"
+  echo "  即使代理装在 NAS 本机，也要填 NAS 的局域网地址，并在代理端允许局域网访问（如 Clash allow-lan）。"
+  printf "  是否使用代理？[Y/n]: "
+  read_line answer || return 1
+  PROXY_ASKED=1
+  case "$answer" in
+    n|N|no|NO|否)
+      PROXY=""
+      env_upsert DSH_PROXY "" || return 1
+      ok "不使用代理：构建与运行全部直连（已保存 .env：DSH_PROXY= 空值）"
+      ;;
+    *)
+      printf "  输入代理地址 [%s]: " "$PROXY"
+      read_line addr || return 1
+      [ -n "$addr" ] || addr="$PROXY"
+      PROXY="$(normalize_proxy "$addr")"
+      case "$PROXY" in
+        http://127.0.0.1:*|http://localhost:*)
+          warn "127.0.0.1/localhost 代理只在运行时（host 网络）可用；构建阶段不可达。"
+          echo "  如构建失败，请改填 NAS 局域网地址（如 http://${LAN_IP:-192.168.x.x}:7890）并开启 allow-lan 后重跑"
+          ;;
+      esac
+      env_upsert DSH_PROXY "$PROXY" || return 1
+      ok "代理已配置并保存到 .env: $PROXY"
+      ;;
+  esac
+  return 0
+}
+
+# 检测 Docker 环境。返回码：
+#   0 就绪；1 docker 未安装；2 daemon 未运行；3 当前用户无权访问 daemon；
+#   4 Engine 版本过低；5 Compose 缺失；6 docker-compose 是 V1
+# 通过项打印 ✓；问题项只描述不计数——由调用方在放弃补救后统一 fail() 一次，
+# 避免补救重查时把同一问题重复计入 FAIL。
+check_docker_env() {
+  command -v docker >/dev/null 2>&1 || { echo "  问题: docker 未安装"; return 1; }
+  if ! docker info >/dev/null 2>&1; then
+    # daemon 可达性必须先查：docker compose version 是纯客户端命令，daemon 挂了也会通过。
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet docker 2>/dev/null; then
+      echo "  问题: Docker daemon 正在运行，但当前用户（$(id -un)）无权访问 /var/run/docker.sock"
+      return 3
+    fi
+    echo "  问题: Docker daemon 未运行"
+    return 2
+  fi
+  ok "Docker daemon 正在运行"
+  local server_v
+  server_v=$(docker version --format '{{.Server.Version}}' 2>/dev/null)
+  if [[ "$server_v" =~ ^[0-9]+\.[0-9]+ ]]; then
+    if docker_engine_version_ok "$server_v"; then
+      ok "Docker Engine $server_v ≥ 20.10"
+    else
+      echo "  问题: Docker Engine 版本 $server_v 过低（需要 ≥ 20.10，Compose V2 支持）"
+      return 4
+    fi
+  else
+    warn "无法解析 Docker Engine 版本: ${server_v:-（空）}；跳过版本检查（需 ≥ 20.10）"
+  fi
   if docker compose version >/dev/null 2>&1; then
     COMPOSE="docker compose"; ok "docker 与 docker compose 可用"
-  elif command -v docker-compose >/dev/null 2>&1 \
-       && docker-compose version 2>/dev/null | head -n 1 | grep -q 'version v2'; then
-    # 独立版二进制也叫 docker-compose，但必须是 V2：compose 文件用了 profiles 和
-    # depends_on condition，V1（python 版）解析不了，兜底接受它只会在 up 时才报错。
-    COMPOSE="docker-compose"; ok "docker-compose（Compose V2 独立版）可用"
-  elif command -v docker-compose >/dev/null 2>&1; then
-    fail "docker-compose 是旧版 V1，不支持本项目 compose 文件（profiles / depends_on condition）；请安装 Compose V2（docker compose 插件或 v2 独立版）"
-  else
-    fail "docker 已安装但没有 compose 插件"
+    return 0
   fi
-else
-  fail "docker 未安装"
+  if command -v docker-compose >/dev/null 2>&1; then
+    if docker-compose version 2>/dev/null | head -n 1 | grep -q 'version v2'; then
+      # 独立版二进制也叫 docker-compose，但必须是 V2：compose 文件用了 profiles 和
+      # depends_on condition，V1（python 版）解析不了，兜底接受它只会在 up 时才报错。
+      COMPOSE="docker-compose"; ok "docker-compose（Compose V2 独立版）可用"
+      return 0
+    fi
+    echo "  问题: docker-compose 是旧版 V1，不支持本项目 compose 文件（profiles / depends_on condition）"
+    return 6
+  fi
+  echo "  问题: docker 已安装但没有 Compose V2（docker compose 插件或 v2 独立版）"
+  return 5
+}
+
+# 交互补救：按问题码询问是否安装/升级/启动。返回 0=已执行动作应重查；1=无法或放弃。
+docker_env_recover() { # $1=check_docker_env 返回码
+  local rc="$1" answer
+  [ -t 0 ] || { echo "  （非交互环境，无法提供自动安装/升级；请按上方提示处理后重跑）"; return 1; }
+  case "$rc" in
+    1)
+      echo "  可通过 Docker 官方脚本安装 Engine + Compose 插件（Debian/Ubuntu/Fedora 等，保留现有配置）:"
+      echo "    curl -fsSL https://get.docker.com | sh"
+      printf "  是否现在自动安装？[y/N]: "
+      read_line answer || return 1
+      case "$answer" in
+        y|Y|yes|YES|是)
+          ensure_proxy_configured || return 1
+          docker_install_official || return 1
+          run_root systemctl start docker 2>/dev/null || run_root service docker start 2>/dev/null || true
+          return 0 ;;
+        *) return 1 ;;
+      esac ;;
+    2)
+      printf "  是否现在启动 Docker daemon？[Y/n]: "
+      read_line answer || return 1
+      case "$answer" in n|N|no|NO|否) return 1 ;; esac
+      if command -v systemctl >/dev/null 2>&1 && run_root systemctl start docker; then return 0; fi
+      if command -v service >/dev/null 2>&1 && run_root service docker start; then return 0; fi
+      echo "  无法通过 systemctl/service 启动；请手动启动 dockerd 后重跑"
+      return 1 ;;
+    3)
+      echo "  两种解决方式:"
+      echo "    a) 把 $(id -un) 加入 docker 组（需注销重新登录后生效，长期方案）"
+      echo "    b) 直接用 sudo 重新运行本脚本"
+      printf "  是否现在把当前用户加入 docker 组？[y/N]: "
+      read_line answer || return 1
+      case "$answer" in
+        y|Y|yes|YES|是)
+          run_root usermod -aG docker "$(id -un)" || return 1
+          echo "  已加入 docker 组；请注销重新登录（或直接 sudo 重跑本脚本）后再次执行"
+          ;;
+      esac
+      return 1 ;;
+    4)
+      echo "  ${C_Y}注意: 升级 Engine 会重启 docker daemon，运行中的容器会短暂中断。${C_0}"
+      echo "  官方脚本会在原位升级（保留配置、容器与数据）: curl -fsSL https://get.docker.com | sh"
+      printf "  是否现在自动升级？[y/N]: "
+      read_line answer || return 1
+      case "$answer" in
+        y|Y|yes|YES|是)
+          ensure_proxy_configured || return 1
+          docker_install_official || return 1
+          return 0 ;;
+        *) return 1 ;;
+      esac ;;
+    5|6)
+      [ "$rc" = 6 ] && echo "  旧版 V1 二进制可保留；脚本优先使用插件版 docker compose。"
+      echo "  安装 Compose V2 插件: apt-get install docker-compose-plugin（或官方脚本一并安装）"
+      printf "  是否现在自动安装？[y/N]: "
+      read_line answer || return 1
+      case "$answer" in
+        y|Y|yes|YES|是)
+          ensure_proxy_configured || return 1
+          if command -v apt-get >/dev/null 2>&1; then
+            echo "  通过 apt 安装 docker-compose-plugin..."
+            if root_net_retry apt-get update && root_net_retry apt-get install -y docker-compose-plugin; then
+              return 0
+            fi
+            echo "  apt 安装失败，改用官方脚本（含 compose 插件）..."
+          fi
+          docker_install_official ;;
+        *) return 1 ;;
+      esac ;;
+    *) return 1 ;;
+  esac
+}
+
+# 检查 → 交互补救 → 重查（最多 3 轮）；放弃或补救失败则 fail 并中止。
+DOCKER_ENV_RC=-1
+for _attempt in 1 2 3; do
+  check_docker_env
+  DOCKER_ENV_RC=$?
+  [ "$DOCKER_ENV_RC" -eq 0 ] && break
+  docker_env_recover "$DOCKER_ENV_RC" || break
+done
+if [ "$DOCKER_ENV_RC" -ne 0 ]; then
+  case "$DOCKER_ENV_RC" in
+    1) fail "docker 未安装且未完成自动安装；可手动: curl -fsSL https://get.docker.com | sh" ;;
+    2) fail "Docker daemon 未运行；请启动后重跑（systemctl start docker）" ;;
+    3) fail "当前用户无权访问 Docker；请 sudo 重跑本脚本，或把用户加入 docker 组后重新登录" ;;
+    4) fail "Docker Engine 版本过低（需 ≥ 20.10）；升级参考: https://docs.docker.com/engine/install/" ;;
+    5) fail "缺少 Compose V2；请安装 docker-compose-plugin（apt）或 v2 独立版" ;;
+    6) fail "docker-compose 为 V1，不支持本项目；请安装 Compose V2" ;;
+    *) fail "Docker 环境检查未通过（码 $DOCKER_ENV_RC）" ;;
+  esac
+  echo "${C_R}${C_B}Docker 环境未就绪，中止部署。${C_0}"
+  exit 1
 fi
+# Docker 环境就绪后统一确认代理选择（后续 npm 版本查询、构建与运行时出站都依赖；
+# 若补救动作前已问过，这里直接跳过）
+ensure_proxy_configured || { fail "代理配置失败"; exit 1; }
 
 # ---------- 必要文件 ----------
 section "2. 文件完整性"
@@ -1548,29 +1805,36 @@ container_running() {
   docker ps --format '{{.Names}}' 2>/dev/null | grep -Fxq "$1"
 }
 
-# 代理监听检测：从 $PROXY 解析目标（本机才检测监听，远程代理只测连通性）
-PROXY_HOSTPORT="${PROXY#http://}"; PROXY_HOSTPORT="${PROXY_HOSTPORT#https://}"
-PROXY_HOST="${PROXY_HOSTPORT%%:*}"
-PROXY_PORT="${PROXY_HOSTPORT##*:}"
-if [ "$PROXY_HOST" = "127.0.0.1" ] || [ "$PROXY_HOST" = "localhost" ]; then
-  case "$PROXY_PORT" in
-    *[!0-9]*|'') warn "代理地址缺端口: $PROXY；dsh 出站可能失败" ;;
-    *)
-      if port_listening "$PROXY_PORT"; then
-        ok "宿主代理端口 $PROXY_PORT 在监听"
-      else
-        warn "宿主 $PROXY_PORT 端口未监听（代理未运行？部署可继续但 dsh 出站会失败）"
-      fi ;;
-  esac
+# 代理监听检测：从 $PROXY 解析目标（本机才检测监听，远程代理只测连通性）；直连模式跳过
+if [ -z "$PROXY" ]; then
+  ok "未配置代理（直连模式），跳过代理监听检测"
 else
-  echo "  代理在远程主机 $PROXY_HOSTPORT（跳过本机监听检测，仅测连通性）"
+  PROXY_HOSTPORT="${PROXY#http://}"; PROXY_HOSTPORT="${PROXY_HOSTPORT#https://}"
+  PROXY_HOST="${PROXY_HOSTPORT%%:*}"
+  PROXY_PORT="${PROXY_HOSTPORT##*:}"
+  if [ "$PROXY_HOST" = "127.0.0.1" ] || [ "$PROXY_HOST" = "localhost" ] \
+     || { [ -n "$LAN_IP" ] && [ "$PROXY_HOST" = "$LAN_IP" ]; }; then
+    case "$PROXY_PORT" in
+      *[!0-9]*|'') warn "代理地址缺端口: $PROXY；dsh 出站可能失败" ;;
+      *)
+        if port_listening "$PROXY_PORT"; then
+          ok "宿主代理端口 $PROXY_PORT 在监听"
+        else
+          warn "宿主 $PROXY_PORT 端口未监听（代理未运行？部署可继续但 dsh 出站会失败）"
+        fi ;;
+    esac
+  else
+    echo "  代理在远程主机 $PROXY_HOSTPORT（跳过本机监听检测，仅测连通性）"
+  fi
 fi
 if http_get 8 "https://api.deepseek.com" >/dev/null 2>&1; then
   ok "直连出站正常"
-elif http_get 8 "https://api.deepseek.com" "$PROXY" >/dev/null 2>&1; then
+elif [ -n "$PROXY" ] && http_get 8 "https://api.deepseek.com" "$PROXY" >/dev/null 2>&1; then
   ok "经代理 $PROXY 出站正常"
-else
+elif [ -n "$PROXY" ]; then
   warn "经代理 $PROXY 访问 api.deepseek.com 失败（代理可能未就绪，部署可继续但模型请求会失败）"
+else
+  warn "直连访问 api.deepseek.com 失败（未配置代理）；国内网络通常需要代理，可重跑并用 --proxy-host 指定"
 fi
 
 CADDY_CURRENT_LISTENERS=""
@@ -1700,12 +1964,18 @@ else
     echo "${C_R}版本选择失败，中止构建。${C_0}"
     exit 1
   fi
-  echo "  构建镜像（首次约 10 分钟，native 依赖编译；npm 走代理 $PROXY；DSH patch=${DSH_TRUSTED_DOMAIN:-关闭}）..."
-  echo "  （patch 在构建 RUN 步骤内执行，BuildKit 进度 UI 会折叠其输出；构建完成后脚本会进入镜像实测 patch 与版本）"
-  if $COMPOSE build \
-       --build-arg "HTTP_PROXY=$PROXY" \
-       --build-arg "HTTPS_PROXY=$PROXY" \
-       --build-arg "DSH_TRUSTED_DOMAIN=$DSH_TRUSTED_DOMAIN"; then
+  # 构建代理参数：直连模式（PROXY 空）不注入 HTTP_PROXY/HTTPS_PROXY build-arg，
+  # 容器内 apt/npm 全部直连
+  BUILD_ARGS=(--build-arg "DSH_TRUSTED_DOMAIN=$DSH_TRUSTED_DOMAIN")
+  if [ -n "$PROXY" ]; then
+    echo "  构建镜像（首次约 10 分钟，native 依赖编译；npm 走代理 $PROXY；DSH patch=${DSH_TRUSTED_DOMAIN:-关闭}）..."
+    echo "  （patch 在构建 RUN 步骤内执行，BuildKit 进度 UI 会折叠其输出；构建完成后脚本会进入镜像实测 patch 与版本）"
+    BUILD_ARGS=(--build-arg "HTTP_PROXY=$PROXY" --build-arg "HTTPS_PROXY=$PROXY" "${BUILD_ARGS[@]}")
+  else
+    echo "  构建镜像（首次约 10 分钟，native 依赖编译；npm 直连；DSH patch=${DSH_TRUSTED_DOMAIN:-关闭}）..."
+    echo "  （patch 在构建 RUN 步骤内执行，BuildKit 进度 UI 会折叠其输出；构建完成后脚本会进入镜像实测 patch 与版本）"
+  fi
+  if $COMPOSE build "${BUILD_ARGS[@]}"; then
     ok "构建完成"
     if ! verify_dsh_image "构建后"; then
       echo "${C_R}构建产物核验失败，镜像与配置不符；中止启动。${C_0}"

@@ -36,10 +36,12 @@ services:
     # 网页升级关闭；dsh 主容器不挂载 Docker socket，避免把宿主 Docker 控制权交给应用进程。
     environment:
       - NODE_USE_ENV_PROXY=1          # 让 Node fetch 读取代理变量（必须）
-      # 运行时代理地址由 .env 的 DSH_PROXY 覆盖（deploy.sh --proxy-host 会写入）；
-      # docker compose 会自动读取项目目录下的 .env 做变量插值
-      - HTTP_PROXY=${DSH_PROXY:-http://127.0.0.1:7890}
-      - HTTPS_PROXY=${DSH_PROXY:-http://127.0.0.1:7890}
+      # 运行时代理地址由 .env 的 DSH_PROXY 控制（deploy.sh 交互选择或 --proxy-host 写入）；
+      # docker compose 会自动读取项目目录下的 .env 做变量插值。
+      # 注意用 "-" 而非 ":-"：DSH_PROXY 未设置时才回落默认；显式空值（DSH_PROXY=）
+      # 表示用户选择了直连，必须原样传递空值，不能回落默认代理。
+      - HTTP_PROXY=${DSH_PROXY-http://127.0.0.1:7890}
+      - HTTPS_PROXY=${DSH_PROXY-http://127.0.0.1:7890}
       - NO_PROXY=127.0.0.1,localhost  # 本地流量不走代理；连局域网 Ollama 时把其 IP 追加进来
     volumes:
       # DSH 数据（配置/凭据/会话/存储），属主 UID 1000

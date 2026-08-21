@@ -21,7 +21,9 @@ dsh 是能执行任意命令的 AI Agent，凭据一旦被拿走就是整台 NAS
 
 ### 支持
 
-- Linux 主机、rootful Docker Engine、Docker Compose V2（`docker compose` 插件或 V2 独立版）
+- Linux 主机、rootful Docker Engine **≥ 20.10**、Docker Compose V2（`docker compose` 插件或 V2 独立版）
+- `deploy.sh` 会检查 Docker daemon 是否运行、Engine 版本是否达标（≥ 20.10）以及 Compose 是否为 V2；检测到问题时在交互终端提供自动补救选项——安装/升级 Engine（官方 get.docker.com 脚本）、启动 daemon、安装 compose 插件（apt）、把当前用户加入 docker 组——确认执行后自动重查，非交互环境则直接报错退出
+- 代理也是交互选项：Docker 环境检查通过后（以及同意自动安装/升级前）询问是否使用代理，选择持久化到 `.env` 的 `DSH_PROXY`（空值 = 直连）；`--proxy-host` 参数或 `.env` 已配置时不再询问。直连模式下构建不注入代理 build-arg，第 6 节跳过代理监听检测- 宿主机**不需要安装 Node.js/npm**——所有 Node 相关步骤（dsh 安装、patch、版本核验）都在容器内执行
 - Bash 与 GNU `sed`/`grep`/`awk`/`stat`
 - x86_64 和 ARM64
 - `network_mode: host`
@@ -177,8 +179,9 @@ sudo ./deploy.sh --latest     # 不询问，直接查询 npm latest，更新版�
 - dsh 版本唯一来源是 `Dockerfile` 的 `ARG DSH_VERSION`。
 - 交互部署在构建前从 npm dist-tags 端点拉取 `latest`（正式版）与 `next`（预览版）版本号，连同 Dockerfile 锁定版一起列出供选择（直连失败自动走代理重试）；选定后原子写回 `Dockerfile`。`--skip-build` 不构建故不询问，`--latest` 已自动选定 latest 不再询问。
 - 版本号查询不受缓存影响：脚本不经 npm 本地缓存（纯 HTTP 直读 registry），每次请求追加唯一时间戳参数并携带 `Cache-Control: no-cache` 请求头，穿透转发代理/CDN 等中间层可能按 URL 缓存的旧响应。
-- 构建阶段的 apt/npm 下载走部署脚本传入的代理；构建容器内 `127.0.0.1` 不是宿主机，代理须填 NAS 局域网地址。
-- 运行时代理来自 `.env` 的 `DSH_PROXY`；`NO_PROXY` 至少含 `127.0.0.1,localhost`。
+- 代理地址的构建/运行差异：**构建容器有独立网络命名空间，`127.0.0.1` 在构建阶段是构建容器自身、代理不可达**；运行时容器是 host 网络，`127.0.0.1` 与局域网地址都可达。因此单一地址取交集 = NAS 局域网地址（代理需允许局域网访问，如 Clash `allow-lan`）。脚本自动探测出口网卡 IP（`ip route get`，兜底过滤后的 `hostname -I`）作为默认建议值；坚持填 `127.0.0.1` 会警告构建不可达但照常保存（仅适合 `--skip-build` 场景）。
+- 构建阶段的 apt/npm 下载走部署脚本传入的代理；直连模式（`DSH_PROXY=` 空值）下构建不注入代理参数。
+- 运行时代理来自 `.env` 的 `DSH_PROXY`（首次部署交互选择，`--proxy-host` 覆盖，空值 = 直连）；compose 用 `-` 插值区分「未设置（回落默认 127.0.0.1:7890）」和「显式空（直连）」，entrypoint 对显式空值 unset 代理变量。`NO_PROXY` 至少含 `127.0.0.1,localhost`。
 - 可选的 `.env` 键 `DSH_TRUSTED_DOMAIN` 只接受纯 hostname（如 `dsh.example.com`），不含协议、端口或路径；非空时 Dockerfile 在 root 构建阶段 patch DSH 的浏览器与 Host API loopback 判定。修改此值必须重新构建 dsh 镜像；执行 `--upgrade`/`--latest` 时脚本会再次询问并保留或修改选择。
 - patch 过程可见性：patch 在构建的 RUN 步骤内执行，BuildKit 进度 UI 会折叠其输出；构建完成后（以及 `--skip-build` 启动前）脚本会进入镜像实测核验并在部署日志打印结论——两个 bundle 是否接受反代域名、镜像内 dsh 版本是否与 Dockerfile 锁定一致，不一致则拒绝启动。需逐行查看 patch 原始输出可运行 `BUILDKIT_PROGRESS=plain docker compose build dsh`。
 - 首次构建需编译 native 依赖，耗时取决于 NAS CPU 和代理速度。
