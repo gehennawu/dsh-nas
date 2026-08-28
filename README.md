@@ -23,7 +23,8 @@ dsh 是能执行任意命令的 AI Agent，凭据一旦被拿走就是整台 NAS
 
 - Linux 主机、rootful Docker Engine **≥ 20.10**、Docker Compose V2（`docker compose` 插件或 V2 独立版）
 - `deploy.sh` 会检查 Docker daemon 是否运行、Engine 版本是否达标（≥ 20.10）以及 Compose 是否为 V2；检测到问题时在交互终端提供自动补救选项——安装/升级 Engine（官方 get.docker.com 脚本）、启动 daemon、安装 compose 插件（apt）、把当前用户加入 docker 组——确认执行后自动重查，非交互环境则直接报错退出
-- 代理也是交互选项：Docker 环境检查通过后（以及同意自动安装/升级前）询问是否使用代理，选择持久化到 `.env` 的 `DSH_PROXY`（空值 = 直连）；`--proxy-host` 参数或 `.env` 已配置时不再询问。直连模式下构建不注入代理 build-arg，第 6 节跳过代理监听检测- 宿主机**不需要安装 Node.js/npm**——所有 Node 相关步骤（dsh 安装、patch、版本核验）都在容器内执行
+- 代理也是交互选项：Docker 环境检查通过后（以及同意自动安装/升级前）询问是否使用代理，选择持久化到 `.env` 的 `DSH_PROXY`（空值 = 直连）；`--proxy-host` 参数或 `.env` 已配置时不再询问。直连模式下构建不注入代理 build-arg，第 6 节跳过代理监听检测。
+- 宿主机**不需要安装 Node.js/npm**——所有 Node 相关步骤（dsh 安装、patch、版本核验）都在容器内执行
 - Bash 与 GNU `sed`/`grep`/`awk`/`stat`
 - x86_64 和 ARM64
 - `network_mode: host`

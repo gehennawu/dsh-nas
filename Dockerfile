@@ -78,7 +78,10 @@ WORKDIR /workspace
 # 容器入口脚本（代理环境变量、显式绑定回环启动 dsh web）
 # tini 会 exec 至该路径，缺失则容器启动即失败（exit 127: No such file）
 COPY entrypoint.sh /usr/local/bin/dsh-entrypoint
-RUN chmod +x /usr/local/bin/dsh-entrypoint
+# COPY 会保留源文件权限；NAS 上若 entrypoint.sh 是 0700/0770，chmod +x 可能留下
+# 0711/0771，node 用户没有读取权限，/bin/sh 会直接 Permission denied。
+# 明确设为 root 可读、所有用户可执行，确保非 root 的 node 用户能打开入口脚本。
+RUN chmod 0755 /usr/local/bin/dsh-entrypoint
 
 USER node
 
