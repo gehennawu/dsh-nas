@@ -90,10 +90,11 @@
 
 - [x] **前置反代 / Tunnel 模式**
   - NAS 自带 Nginx/OpenResty、lucky 或 Cloudflare Tunnel 负责公网 TLS。
-  - Caddy 只监听内部端口，例如 `127.0.0.1:13080`。
+  - Caddy 同机模式只监听 `127.0.0.1:13080`；跨机模式只监听 DSH NAS 的具体局域网 IP，例如 `192.168.123.131:13080`，拒绝 wildcard/额外 listener。
+  - 跨机模式的 `auth` 与 `dsh` 站点均以 `remote_ip` 只允许 Lucky 的直接 TCP 来源，例如 `192.168.123.1`；不使用 `client_ip`、X-Forwarded-For 或 PROXY protocol 做 ACL。
   - 前置代理将 `dsh.example.com` 和 `auth.example.com` 都转发到 Caddy。
   - 前置代理发送 `X-Forwarded-Proto: https`。
-  - 文档说明 bridge 容器中的 `127.0.0.1` 不等于宿主机，需使用 host 网络、宿主可达地址或 host gateway。
+  - 跨机模式要求 DSH NAS 防火墙只允许 Lucky 来源访问 TCP 13080；Lucky→Caddy 默认为明文 HTTP，局域网必须可信。
 
 ## P0：安全止血
 
@@ -138,7 +139,7 @@
 - [x] 补充 Caddy 实际 listener 端口检查。
 - [x] 验证 dsh 只监听 `127.0.0.1:3080`（部署后安全校验）。
 - [x] 验证 Authelia 只监听 `127.0.0.1:9091`。
-- [x] 验证 Caddy 只监听当前入口模式允许的端口和回环绑定（通过 admin API listener 检查）。
+- [x] 验证 Caddy 只监听当前入口模式允许的端口和绑定地址（通过 admin API listener 检查）；跨机模式同时校验两个站点的 `remote_ip` 来源 ACL 与 403 fallback。
 - [ ] 验证未登录访问 dsh 的 forward_auth/重定向链路。
 - [ ] 在可用 Docker 环境中验证 TLS、WebSocket 和 SSE。
 
@@ -149,7 +150,7 @@
 - [x] 443-only 模式显式设置 `auto_https disable_redirects`。
 - [ ] 443-only 模式完成公网 ACME 验证，并在文档中明确使用 TLS-ALPN-01 或 DNS-01（当前配置依赖 Caddy 默认挑战选择）。
 - [x] 443-only 模式启动后确认没有 `:80` listener。
-- [x] 反代入口模式只检查内部端口，例如 13080。
+- [x] 反代入口模式检查内部端口、精确 bind 地址和跨机来源 ACL（例如 `192.168.123.131:13080` 仅允许 `192.168.123.1`）。
 - [x] 删除 Basic Auth 模式及其向导分支、模板和文档。
 - [x] README 说明 80 被占用时的选择取决于 443 是否可用以及是否存在前置反代。
 - [x] 为入口模式兼容回退输出明确的模式、风险和人工操作提示。

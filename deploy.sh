@@ -58,6 +58,8 @@ UPGRADE_ENV_SNAPSHOT_READY=0
 UPGRADE_ENV_ROLLBACK_ARMED=0
 UPGRADE_FULL_SNAPSHOT_READY=0
 INTERNAL_PORT=13080     # 反代入口模式（lucky/CF）Caddy 内部 http 监听端口
+FRONT_BIND_ADDRESS=127.0.0.1  # Caddy 反代入口监听地址；远程 Lucky 时为本机局域网 IP
+FRONT_PROXY_SOURCE_IP=""      # 远程 Lucky 的直连来源 IP；空值表示同机/不启用来源限制
 MODE_DIRECT_80_443='direct-80-443'
 MODE_DIRECT_443_ONLY='direct-443-only'
 MODE_FRONT_PROXY='front-proxy'
@@ -93,7 +95,8 @@ usage() {
   echo "使用代理，选择持久化到 .env（DSH_PROXY= 空值表示直连）；--proxy-host 参数"
   echo "或 .env 已配置时不再询问"
   echo "  --setup             强制重跑配置向导（可换域名/入口/密码；原文件备份为 .bak，Authelia 密钥保留）"
-  echo "                      向导还会选择是否启用反代域名 patch，并保存 DSH_TRUSTED_DOMAIN"
+  echo "                      向导还会选择是否启用/更新 DSH 反代域名 patch，并保存 DSH_TRUSTED_DOMAIN"
+  echo "                      前置反代可选择同机 Lucky 或跨机 Lucky（跨机时限制来源 IP）"
   echo "  --upgrade           升级模式：跳过 Caddy/Authelia 向导，但仍询问是否启用/更新 dsh 域名 patch"
   echo "  --latest            自动升级到 npm 最新版：查询 @deepseek-ai/dsh latest，更新版本号后"
   echo "                      构建（隐含 --upgrade；需已完成一次正常部署；仍询问 patch）"
@@ -205,6 +208,79 @@ valid_trusted_domain() { # $1=hostname
   [[ "$domain" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]]
 }
 
+valid_ipv4() { # $1=IPv4 address
+  local ip="$1" octet
+  [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  IFS=. read -r -a octets <<< "$ip"
+  for octet in "${octets[@]}"; do
+    [ "$octet" -le 255 ] 2>/dev/null || return 1
+  done
+}
+
+valid_front_bind_address() { # $1=Caddy bind address；允许 127.0.0.1 或具体局域网 IPv4，拒绝 wildcard
+  valid_ipv4 "$1" || return 1
+  [ "$1" != "0.0.0.0" ] || return 1
+  [ "$1" = "127.0.0.1" ] && return 0
+  [[ "$1" != 127.* ]]
+}
+
+valid_front_proxy_source_ip() { # $1=Lucky 直连来源；拒绝 wildcard、loopback 和组播地址
+  valid_ipv4 "$1" || return 1
+  local first=${1%%.*}
+  [ "$1" != "0.0.0.0" ] && [ "$1" != "255.255.255.255" ] \
+    && [ "$first" -lt 224 ] 2>/dev/null || return 1
+  [[ "$1" != 127.* ]]
+}
+
+configure_front_proxy_network() {
+  local selection="" bind="" source="" default_bind=""
+  FRONT_PROXY_CONFIG_CHANGED=0
+  echo
+  echo "  前置代理位置："
+  echo "    1) Lucky 与 DSH 同机（Caddy 仅监听 127.0.0.1）"
+  echo "    2) Lucky 在其它机器（Caddy 监听指定局域网 IP，并限制 Lucky 来源）"
+  printf "  请输入 1 或 2 [1]: "
+  read_line selection || return 1
+  [ -z "$selection" ] && selection=1
+  case "$selection" in
+    1)
+      FRONT_BIND_ADDRESS=127.0.0.1
+      FRONT_PROXY_SOURCE_IP=""
+      FRONT_PROXY_CONFIG_CHANGED=1
+      ok "已选择同机前置代理：Caddy 仅监听 127.0.0.1:$INTERNAL_PORT"
+      ;;
+    2)
+      # 这是入站安全配置，不复用 LAN_IP（它是出站代理建议地址，可能来自 VPN/WAN 网卡）。
+      # 默认值针对本项目的 NAS/Lucky 拓扑；向导仍要求用户确认并可修改。
+      default_bind="192.168.123.131"
+      printf "  DSH/NAS 局域网 IPv4（Caddy 监听地址）[%s]: " "$default_bind"
+      read_line bind || return 1
+      [ -z "$bind" ] && bind="$default_bind"
+      if ! valid_front_bind_address "$bind"; then
+        fail "无效 Caddy 监听地址: $bind（必须是本机具体局域网 IPv4，不能是 0.0.0.0 或 127.0.0.1）"
+        return 1
+      fi
+      printf "  Lucky 局域网 IPv4（仅允许此来源访问 Caddy）[%s]: " "${SAVED_FRONT_PROXY_SOURCE_IP:-192.168.123.1}"
+      read_line source || return 1
+      [ -z "$source" ] && source="${SAVED_FRONT_PROXY_SOURCE_IP:-192.168.123.1}"
+      [ "$source" = "$bind" ] && { fail "Lucky 来源地址不能与 Caddy 监听地址相同"; return 1; }
+      if ! valid_front_proxy_source_ip "$source"; then
+        fail "无效 Lucky 来源地址: $source（必须是 IPv4）"
+        return 1
+      fi
+      FRONT_BIND_ADDRESS="$bind"
+      FRONT_PROXY_SOURCE_IP="$source"
+      FRONT_PROXY_CONFIG_CHANGED=1
+      ok "已选择跨机前置代理：Caddy 监听 $FRONT_BIND_ADDRESS:$INTERNAL_PORT，仅允许 Lucky $FRONT_PROXY_SOURCE_IP"
+      echo "  ${C_Y}  防火墙仍需允许 $FRONT_PROXY_SOURCE_IP → $FRONT_BIND_ADDRESS:$INTERNAL_PORT，拒绝其它来源${C_0}"
+      ;;
+    *)
+      fail "无效前置代理位置: $selection（应为 1 或 2）"
+      return 1
+      ;;
+  esac
+}
+
 configure_trusted_domain() { # $1=已保存 hostname $2=当前 Caddy dsh hostname（可选）
   local saved_domain="$1" suggested_domain="${2:-}" answer="" domain="" confirm=""
   if [ ! -t 0 ]; then
@@ -293,6 +369,17 @@ persist_trusted_domain() {
   if [ "$DSH_TRUSTED_DOMAIN_CHANGED" -eq 1 ] || ! grep -q '^DSH_TRUSTED_DOMAIN=' "$ENV_FILE" 2>/dev/null; then
     env_upsert DSH_TRUSTED_DOMAIN "$DSH_TRUSTED_DOMAIN" || return 1
     ok "已保存 DSH_TRUSTED_DOMAIN=${DSH_TRUSTED_DOMAIN:-（未启用 patch）}"
+  fi
+}
+
+persist_front_proxy_network() {
+  [ "$ENTRY_MODE" = "$MODE_FRONT_PROXY" ] || return 0
+  if [ "$FRONT_PROXY_CONFIG_CHANGED" -eq 1 \
+     ] || ! grep -q '^FRONT_PROXY_BIND_ADDRESS=' "$ENV_FILE" 2>/dev/null \
+     || ! grep -q '^FRONT_PROXY_SOURCE_IP=' "$ENV_FILE" 2>/dev/null; then
+    env_upsert FRONT_PROXY_BIND_ADDRESS "$FRONT_BIND_ADDRESS" || return 1
+    env_upsert FRONT_PROXY_SOURCE_IP "$FRONT_PROXY_SOURCE_IP" || return 1
+    ok "已保存前置代理网络：Caddy=$FRONT_BIND_ADDRESS:$INTERNAL_PORT，Lucky 来源=$FRONT_PROXY_SOURCE_IP"
   fi
 }
 
@@ -791,6 +878,9 @@ validate_restored_stack() {
     echo "  ${C_R}回滚 listener: Caddy 实际为 $(printf '%s ' "$CADDY_LISTENERS")${C_0}"
     return 1
   fi
+  if declare -F validate_front_proxy_policy >/dev/null 2>&1; then
+    validate_front_proxy_policy || return 1
+  fi
   return 0
 }
 rollback_upgrade() {
@@ -881,6 +971,11 @@ ENV_FILE="$SCRIPT_DIR/.env"
 SAVED_PROXY=""
 SAVED_PROXY_KEY_EXISTS=0
 SAVED_TRUSTED_DOMAIN=""
+SAVED_FRONT_PROXY_BIND_ADDRESS=""
+SAVED_FRONT_PROXY_SOURCE_IP=""
+FRONT_PROXY_BIND_COUNT=0
+FRONT_PROXY_SOURCE_COUNT=0
+FRONT_PROXY_CONFIG_CHANGED=0
 TRUSTED_DOMAIN_COUNT=0
 if [ -f "$ENV_FILE" ]; then
   # DSH_PROXY 键存在但值为空 = 显式选择直连（与键不存在区分开，避免每次重跑都再问一遍）
@@ -897,14 +992,34 @@ if [ -f "$ENV_FILE" ]; then
     exit 1
   fi
   SAVED_TRUSTED_DOMAIN=$(sed -n 's/^DSH_TRUSTED_DOMAIN=//p' "$ENV_FILE" | head -n 1)
+  FRONT_PROXY_BIND_COUNT=$(grep -c '^FRONT_PROXY_BIND_ADDRESS=' "$ENV_FILE" 2>/dev/null || true)
+  FRONT_PROXY_SOURCE_COUNT=$(grep -c '^FRONT_PROXY_SOURCE_IP=' "$ENV_FILE" 2>/dev/null || true)
+  if [ "$FRONT_PROXY_BIND_COUNT" -gt 1 ] || [ "$FRONT_PROXY_SOURCE_COUNT" -gt 1 ]; then
+    echo "错误: $ENV_FILE 中存在重复的前置代理网络配置，无法安全判断"
+    exit 1
+  fi
+  SAVED_FRONT_PROXY_BIND_ADDRESS=$(sed -n 's/^FRONT_PROXY_BIND_ADDRESS=//p' "$ENV_FILE" | head -n 1)
+  SAVED_FRONT_PROXY_SOURCE_IP=$(sed -n 's/^FRONT_PROXY_SOURCE_IP=//p' "$ENV_FILE" | head -n 1)
 fi
 SAVED_PROXY="${SAVED_PROXY%$'\r'}"   # .env 被 Windows 编辑器存成 CRLF 时剥掉回车
 SAVED_TRUSTED_DOMAIN="${SAVED_TRUSTED_DOMAIN%$'\r'}"
+SAVED_FRONT_PROXY_BIND_ADDRESS="${SAVED_FRONT_PROXY_BIND_ADDRESS%$'\r'}"
+SAVED_FRONT_PROXY_SOURCE_IP="${SAVED_FRONT_PROXY_SOURCE_IP%$'\r'}"
+if [ -n "$SAVED_FRONT_PROXY_BIND_ADDRESS" ] && ! valid_front_bind_address "$SAVED_FRONT_PROXY_BIND_ADDRESS"; then
+  echo "错误: $ENV_FILE 中的 FRONT_PROXY_BIND_ADDRESS 无效: $SAVED_FRONT_PROXY_BIND_ADDRESS（必须是具体 IPv4，不能是 wildcard）"
+  exit 1
+fi
+if [ -n "$SAVED_FRONT_PROXY_SOURCE_IP" ] && ! valid_front_proxy_source_ip "$SAVED_FRONT_PROXY_SOURCE_IP"; then
+  echo "错误: $ENV_FILE 中的 FRONT_PROXY_SOURCE_IP 无效: $SAVED_FRONT_PROXY_SOURCE_IP（必须是可作为 Lucky 直连来源的单播 IPv4）"
+  exit 1
+fi
 if ! valid_trusted_domain "$SAVED_TRUSTED_DOMAIN"; then
   echo "错误: $ENV_FILE 中的 DSH_TRUSTED_DOMAIN 无效: $SAVED_TRUSTED_DOMAIN（只允许 hostname，不含协议、端口或路径）"
   exit 1
 fi
 DSH_TRUSTED_DOMAIN="$SAVED_TRUSTED_DOMAIN"
+FRONT_BIND_ADDRESS="${SAVED_FRONT_PROXY_BIND_ADDRESS:-127.0.0.1}"
+FRONT_PROXY_SOURCE_IP="${SAVED_FRONT_PROXY_SOURCE_IP:-}"
 if [ "$UPGRADE_MODE" -eq 1 ] && ! capture_upgrade_env_before_mutation; then
   echo "错误: 无法在升级前保存原始 .env，拒绝继续升级"
   exit 1
@@ -965,7 +1080,7 @@ listener_addresses() { # $1=port
   fi
 }
 
-# Caddy admin API 中的实际 HTTP listener（按行输出，如 :443 或 127.0.0.1:13080）。
+# Caddy admin API 中的实际 HTTP listener（按行输出，如 :443 或 192.168.1.100:13080）。
 caddy_listeners() {
   local config
   config=$(docker exec dsh-caddy wget -qO- http://127.0.0.1:2019/config/ 2>/dev/null) || return 1
@@ -990,7 +1105,7 @@ caddy_container_owns_port() { # $1=port；admin API 不可读时保守返回失�
 caddy_listener_set_ok() {
   case "$ENTRY_MODE" in
     "$MODE_FRONT_PROXY")
-      printf '%s\n' "$CADDY_LISTENERS" | grep -Fxq "127.0.0.1:$INTERNAL_PORT" \
+      printf '%s\n' "$CADDY_LISTENERS" | grep -Fxq "$FRONT_BIND_ADDRESS:$INTERNAL_PORT" \
         && [ "$(printf '%s\n' "$CADDY_LISTENERS" | sort -u | wc -l)" -eq 1 ]
       ;;
     "$MODE_DIRECT_80_443")
@@ -1116,6 +1231,7 @@ run_setup_wizard() {
         if [ "$PUBLIC_PORT" != "443" ]; then
           echo "  ${C_Y}  公网访问将是 https://dsh.$ROOT:$PUBLIC_PORT / https://auth.$ROOT:$PUBLIC_PORT（记得防火墙放行 $PUBLIC_PORT）${C_0}"
         fi
+        configure_front_proxy_network || return 1
         ;;
       *) fail "无效入口方式: $ENTRY_SEL（应为 1、2 或 3）"; return 1 ;;
     esac
@@ -1193,22 +1309,47 @@ run_setup_wizard() {
       # lucky / CF Tunnel 反代入口：TLS 由前置终结，Caddy 内部 http（$INTERNAL_PORT）
       # authelia_url 用公网 URL（含 lucky 监听端口，如 https://auth.example.com:16666）
       AUTH_URL=$(pub_url "auth.$ROOT")
+      if [ "$FRONT_BIND_ADDRESS" = "127.0.0.1" ]; then
+        FRONT_NETWORK_DESC="同机回环"
+      else
+        FRONT_NETWORK_DESC="跨机地址 $FRONT_BIND_ADDRESS（仅允许 Lucky $FRONT_PROXY_SOURCE_IP）"
+      fi
+      if [ -n "$FRONT_PROXY_SOURCE_IP" ]; then
+        FRONT_AUTH_OPEN="    @lucky remote_ip $FRONT_PROXY_SOURCE_IP
+    handle @lucky {"
+        FRONT_AUTH_CLOSE="    }
+    handle {
+        respond \"Forbidden\" 403
+    }"
+        FRONT_DSH_OPEN="$FRONT_AUTH_OPEN"
+        FRONT_DSH_CLOSE="$FRONT_AUTH_CLOSE"
+      else
+        FRONT_AUTH_OPEN=""
+        FRONT_AUTH_CLOSE=""
+        FRONT_DSH_OPEN=""
+        FRONT_DSH_CLOSE=""
+      fi
       cat > "$CADDYFILE" <<EOF
 # dsh-nas-entry-mode: front-proxy
+# dsh-nas-front-proxy-bind: $FRONT_BIND_ADDRESS
+# dsh-nas-front-proxy-source: ${FRONT_PROXY_SOURCE_IP:-none}
 # 由 deploy.sh 配置向导生成（模式：lucky/CF 反代入口，Caddy 内部 http）（原始文件备份于同目录 .bak）
 {
     auto_https off
     http_port $INTERNAL_PORT
-    default_bind 127.0.0.1
+    default_bind $FRONT_BIND_ADDRESS
 }
 
-http://auth.$ROOT {
+http://auth.$ROOT:$INTERNAL_PORT {
+$FRONT_AUTH_OPEN
     reverse_proxy 127.0.0.1:9091 {
         header_up X-Forwarded-Proto https
     }
+$FRONT_AUTH_CLOSE
 }
 
-http://dsh.$ROOT {
+http://dsh.$ROOT:$INTERNAL_PORT {
+$FRONT_DSH_OPEN
     forward_auth 127.0.0.1:9091 {
         uri /api/authz/forward-auth?authelia_url=$AUTH_URL
         copy_headers Remote-User Remote-Groups Remote-Email Remote-Name
@@ -1226,12 +1367,16 @@ http://dsh.$ROOT {
         header_up Origin http://127.0.0.1:3080
         header_up X-Forwarded-Proto https
     }
+$FRONT_DSH_CLOSE
 }
 EOF
-      ok "已生成 Caddyfile（反代入口模式，内部 http://127.0.0.1:$INTERNAL_PORT，域名 $ROOT）"
-      echo "  ${C_Y}  提示: 在 lucky/CF 中把 dsh.$ROOT 和 auth.$ROOT 都转发到 http://127.0.0.1:$INTERNAL_PORT，并设 X-Forwarded-Proto: https。"
-      echo "  后端地址必须填 127.0.0.1，不能填 NAS 局域网 IP——Caddy 只监听回环，局域网无法绕过认证直连。"
-      echo "  前置反代必须与本机 Caddy 同网络命名空间（host 网络）或能访问 NAS 回环地址，否则转发不通${C_0}"
+      ok "已生成 Caddyfile（反代入口，Caddy $FRONT_BIND_ADDRESS:$INTERNAL_PORT，$FRONT_NETWORK_DESC，域名 $ROOT）"
+      if [ -n "$FRONT_PROXY_SOURCE_IP" ]; then
+        echo "  ${C_Y}  Lucky 后端填 http://$FRONT_BIND_ADDRESS:$INTERNAL_PORT；Caddy 与防火墙均只允许来源 $FRONT_PROXY_SOURCE_IP。${C_0}"
+      else
+        echo "  ${C_Y}  同机 Lucky 后端填 http://127.0.0.1:$INTERNAL_PORT。${C_0}"
+      fi
+      echo "  ${C_Y}  dsh.$ROOT 和 auth.$ROOT 都需转发，并设 X-Forwarded-Proto: https；Lucky→Caddy 使用明文 HTTP，请确保局域网可信。${C_0}"
     else
       if [ "$ENTRY_MODE" = "$MODE_DIRECT_80_443" ]; then
         # Caddy 直连公网：80/443，保留 HTTP→HTTPS 跳转并允许 ACME HTTP-01。
@@ -1612,6 +1757,22 @@ if [ "$UPGRADE_MODE" -eq 1 ] || [ "$SETUP_WIZARD_RAN" -eq 1 ]; then
     exit 1
   }
 fi
+if [ "$SETUP_WIZARD_RAN" -eq 1 ]; then
+  persist_front_proxy_network || {
+    fail "无法保存前置代理网络配置到 $ENV_FILE"
+    exit 1
+  }
+fi
+if [ "$ENTRY_MODE" = "$MODE_FRONT_PROXY" ] && [ "$SETUP_WIZARD_RAN" -eq 0 ]; then
+  if [ "$FRONT_BIND_ADDRESS" != "127.0.0.1" ] && [ -z "$FRONT_PROXY_SOURCE_IP" ]; then
+    fail "检测到跨机 Caddy 监听地址 $FRONT_BIND_ADDRESS，但缺少 FRONT_PROXY_SOURCE_IP；请运行 ./deploy.sh --setup"
+    exit 1
+  fi
+  if ! valid_front_bind_address "$FRONT_BIND_ADDRESS" || { [ -n "$FRONT_PROXY_SOURCE_IP" ] && ! valid_front_proxy_source_ip "$FRONT_PROXY_SOURCE_IP"; }; then
+    fail "前置反代网络配置无效；请运行 ./deploy.sh --setup 重新配置"
+    exit 1
+  fi
+fi
 
 # Basic Auth 已删除：过滤注释后，发现旧的裸端口站点或 basic_auth 指令时直接要求迁移。
 if printf '%s\n' "$ACTIVE_CADDY" | grep -qE '(^|[[:space:]])(:[0-9]+|basic_auth|basicauth)([[:space:]]|\{|$)'; then
@@ -1628,9 +1789,11 @@ if [ -n "$MODE_MARKER" ]; then
     *) fail "Caddyfile 的入口模式标记无效: $MODE_MARKER"; exit 1 ;;
   esac
 else
-  if printf '%s\n' "$ACTIVE_CADDY" | grep -qE '(^|[[:space:]])http://'; then
+  # 只看站点地址行首；不能把 reverse_proxy 的 Origin http://127.0.0.1:3080
+  # 误识别为前置反代模式。
+  if printf '%s\n' "$ACTIVE_CADDY" | grep -qE '^[[:space:]]*http://'; then
     ENTRY_MODE="$MODE_FRONT_PROXY"
-  elif printf '%s\n' "$ACTIVE_CADDY" | grep -qE '(^|[[:space:]])https://'; then
+  elif printf '%s\n' "$ACTIVE_CADDY" | grep -qE '^[[:space:]]*https://'; then
     ENTRY_MODE="$MODE_DIRECT_443_ONLY"
   else
     fail "无法确定 Caddy 入口模式；请运行 ./deploy.sh --setup 重新生成带模式标记的配置"
@@ -1667,6 +1830,44 @@ validate_caddy_config() {
   fi
   ok "Caddyfile 语法校验通过"
 }
+
+validate_front_proxy_policy() {
+  [ "$ENTRY_MODE" = "$MODE_FRONT_PROXY" ] || return 0
+  local active auth_site dsh_site remote_count fallback_count
+  active=$(sed '/^[[:space:]]*#/d' "$CADDYFILE")
+  if ! printf '%s\n' "$active" | grep -qE "^[[:space:]]*default_bind[[:space:]]+$FRONT_BIND_ADDRESS[[:space:]]*$"; then
+    fail "前置反代 Caddy 未绑定期望地址 $FRONT_BIND_ADDRESS；请运行 ./deploy.sh --setup"
+    return 1
+  fi
+  if printf '%s\n' "$active" | grep -qE '(^|[[:space:]])(client_ip|trusted_proxies|proxy_protocol|listener_wrappers)([[:space:]]|$)'; then
+    fail "前置反代配置使用了不允许的转发来源机制；请使用直接 TCP 对端 remote_ip，禁止 client_ip/X-Forwarded-For/PROXY protocol"
+    return 1
+  fi
+  auth_site=$(printf '%s\n' "$active" | grep -cE "^[[:space:]]*http://auth\\.[^[:space:]]+:$INTERNAL_PORT[[:space:]]*\\{" || true)
+  dsh_site=$(printf '%s\n' "$active" | grep -cE "^[[:space:]]*http://dsh\\.[^[:space:]]+:$INTERNAL_PORT[[:space:]]*\\{" || true)
+  if [ "$auth_site" -ne 1 ] || [ "$dsh_site" -ne 1 ]; then
+    fail "跨机前置反代必须为 auth/dsh 站点显式声明内部端口 $INTERNAL_PORT"
+    return 1
+  fi
+  if [ "$FRONT_BIND_ADDRESS" = "127.0.0.1" ]; then
+    [ -z "$FRONT_PROXY_SOURCE_IP" ] || {
+      fail "同机前置反代不应配置远程 Lucky 来源 ACL"
+      return 1
+    }
+    return 0
+  fi
+  if ! valid_front_proxy_source_ip "$FRONT_PROXY_SOURCE_IP" || [ "$FRONT_PROXY_SOURCE_IP" = "$FRONT_BIND_ADDRESS" ]; then
+    fail "跨机前置反代缺少有效 Lucky 来源 IP"
+    return 1
+  fi
+  remote_count=$(printf '%s\n' "$active" | grep -cF "@lucky remote_ip $FRONT_PROXY_SOURCE_IP" || true)
+  fallback_count=$(printf '%s\n' "$active" | grep -cF 'respond "Forbidden" 403' || true)
+  if [ "$remote_count" -ne 2 ] || [ "$fallback_count" -ne 2 ]; then
+    fail "跨机前置反代必须在 auth/dsh 两个站点启用 remote_ip $FRONT_PROXY_SOURCE_IP 及 403 fallback"
+    return 1
+  fi
+  ok "跨机前置反代策略通过：$FRONT_BIND_ADDRESS:$INTERNAL_PORT，仅允许 TCP 来源 $FRONT_PROXY_SOURCE_IP"
+}
 if [ "$UPGRADE_MODE" -eq 0 ]; then
   validate_authelia_config || exit 1
 fi
@@ -1674,9 +1875,20 @@ if [ -n "$COMPOSE" ]; then
   validate_compose_config || exit 1
 fi
 validate_caddy_config || exit 1
+validate_front_proxy_policy || exit 1
 
 # 反代入口模式下从 authelia_url 还原公网端口；缺失或非法时不静默回退。
 if [ "$ENTRY_MODE" = "$MODE_FRONT_PROXY" ]; then
+  if [ -z "$SAVED_FRONT_PROXY_BIND_ADDRESS" ]; then
+    FRONT_BIND_ADDRESS=127.0.0.1
+  fi
+  if [ -z "$FRONT_PROXY_SOURCE_IP" ]; then
+    FRONT_PROXY_SOURCE_IP=""
+  fi
+  if [ "$FRONT_BIND_ADDRESS" != "127.0.0.1" ] && [ -z "$FRONT_PROXY_SOURCE_IP" ]; then
+    fail "跨机前置反代缺少 FRONT_PROXY_SOURCE_IP；请运行 ./deploy.sh --setup"
+    exit 1
+  fi
   CADDY_PUBLIC_PORT=$(printf '%s\n' "$ACTIVE_CADDY" | grep -oE 'authelia_url=https?://[^[:space:]{}]+' | head -n 1 | sed -n 's#.*:\([0-9][0-9]*\)$#\1#p')
   if [ -n "$CADDY_PUBLIC_PORT" ]; then
     if [ "$CADDY_PUBLIC_PORT" -lt 1 ] || [ "$CADDY_PUBLIC_PORT" -gt 65535 ]; then
@@ -1885,22 +2097,22 @@ else
 fi
 
 if [ "$ENTRY_MODE" = "$MODE_FRONT_PROXY" ]; then
-  # 反代入口（lucky/CF）：Caddy 只监听内部 $INTERNAL_PORT，公网端口由前置反代负责。
+  # 反代入口（lucky/CF）：Caddy 只监听 FRONT_BIND_ADDRESS:$INTERNAL_PORT，公网端口由前置反代负责。
   FRONT_LISTENERS=$(listener_addresses "$INTERNAL_PORT" 2>/dev/null || true)
   if [ -n "$FRONT_LISTENERS" ]; then
     if container_running dsh-caddy \
-       && printf '%s\n' "$CADDY_CURRENT_LISTENERS" | grep -Fxq "127.0.0.1:$INTERNAL_PORT" \
+       && printf '%s\n' "$CADDY_CURRENT_LISTENERS" | grep -Fxq "$FRONT_BIND_ADDRESS:$INTERNAL_PORT" \
        && [ "$(printf '%s\n' "$CADDY_CURRENT_LISTENERS" | sort -u | wc -l)" -eq 1 ]; then
-      ok "dsh-caddy 容器已运行，确认占用回环内部端口 127.0.0.1:$INTERNAL_PORT"
+      ok "dsh-caddy 容器已运行，确认占用 $FRONT_BIND_ADDRESS:$INTERNAL_PORT"
     elif container_running dsh-caddy && [ -n "$CADDY_CURRENT_LISTENERS" ]; then
-      fail "现有 dsh-caddy listener 不符合回环内部模式（实际：$(printf '%s ' "$CADDY_CURRENT_LISTENERS")）"
+      fail "现有 dsh-caddy listener 不符合前置反代模式（期望 $FRONT_BIND_ADDRESS:$INTERNAL_PORT，实际：$(printf '%s ' "$CADDY_CURRENT_LISTENERS")）"
     elif container_running dsh-caddy; then
       fail "现有 dsh-caddy 已运行但无法读取 admin API listener；拒绝假定其占用端口安全"
     else
-      fail "宿主 $INTERNAL_PORT 端口已被占用（实际 listener: $(printf '%s ' "$FRONT_LISTENERS")；Caddy 需绑定回环内部端口）"
+      fail "宿主 $INTERNAL_PORT 端口已被占用（实际 listener: $(printf '%s ' "$FRONT_LISTENERS")；Caddy 需绑定 $FRONT_BIND_ADDRESS:$INTERNAL_PORT）"
     fi
   else
-    ok "Caddy 内部端口 $INTERNAL_PORT 空闲"
+    ok "Caddy 内部端口 $INTERNAL_PORT 空闲（绑定 $FRONT_BIND_ADDRESS）"
   fi
 elif [ "$ENTRY_MODE" = "$MODE_DIRECT_80_443" ]; then
   for required_port in 80 443; do
@@ -2096,11 +2308,15 @@ else
   if [ -z "$CADDY_LISTENERS" ]; then
     fail "无法从 Caddy admin API 读取 HTTP listener；拒绝继续部署"
   elif caddy_listener_set_ok; then
-    case "$ENTRY_MODE" in
-      "$MODE_FRONT_PROXY") ok "Caddy 反代模式仅监听回环内部端口 127.0.0.1:$INTERNAL_PORT" ;;
-      "$MODE_DIRECT_80_443") ok "Caddy 直连 80/443 模式仅监听 80 和 443" ;;
-      "$MODE_DIRECT_443_ONLY") ok "Caddy 443-only 模式仅监听 443，未发现 80 listener" ;;
-    esac
+    if ! validate_front_proxy_policy; then
+      :
+    else
+      case "$ENTRY_MODE" in
+        "$MODE_FRONT_PROXY") ok "Caddy 反代模式仅监听 $FRONT_BIND_ADDRESS:$INTERNAL_PORT（来源限制：${FRONT_PROXY_SOURCE_IP:-无，同机回环}）" ;;
+        "$MODE_DIRECT_80_443") ok "Caddy 直连 80/443 模式仅监听 80 和 443" ;;
+        "$MODE_DIRECT_443_ONLY") ok "Caddy 443-only 模式仅监听 443，未发现 80 listener" ;;
+      esac
+    fi
   else
     fail "Caddy listener 不符合入口模式 $ENTRY_MODE 的安全预期（实际：$(printf '%s ' "$CADDY_LISTENERS")）"
   fi

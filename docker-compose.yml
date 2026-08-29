@@ -85,7 +85,7 @@ services:
   caddy:
     image: caddy:2-alpine
     container_name: dsh-caddy
-    network_mode: host        # 监听 80/443、仅 443，或回环 13080（由 Caddyfile 入口模式决定）
+    network_mode: host        # 监听 80/443、仅 443，或同机回环/跨机局域网地址的 13080（由 Caddyfile 入口模式决定）
     volumes:
       - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       - ./caddy/data:/data    # Let's Encrypt 证书，持久化

@@ -47,9 +47,9 @@ dsh 是能执行任意命令的 AI Agent，凭据一旦被拿走就是整台 NAS
     ├─ 直连 80/443 或 443-only ──> Caddy ──> Authelia 127.0.0.1:9091
     │                                      └─> dsh 127.0.0.1:3080
     │
-    └─ 同机前置反代/Tunnel ──> Caddy 127.0.0.1:13080
-                                         ├─> Authelia 127.0.0.1:9091
-                                         └─> dsh 127.0.0.1:3080
+    └─ 前置反代/Tunnel ──> Caddy（同机 127.0.0.1:13080，或跨机 NAS_IP:13080）
+                                      ├─> Authelia 127.0.0.1:9091
+                                      └─> dsh 127.0.0.1:3080
 
  dsh 出站请求 ──> NAS 宿主代理（默认 127.0.0.1:7890）
 ```
@@ -59,17 +59,17 @@ dsh 是能执行任意命令的 AI Agent，凭据一旦被拿走就是整台 NAS
 - `deploy.sh` 启动后校验 dsh/Authelia/Caddy 的实际 listener，关键安全检查失败即非零退出。
 - dsh 容器不挂载 Docker socket，运行镜像不含 Docker CLI/Compose。
 - 重启与升级都在 NAS 命令行执行：`docker compose restart dsh`、`sudo ./deploy.sh --upgrade`。
-- 必须使用域名 + Authelia 双因素，或同机已终结公网 TLS 的前置反代/Tunnel。
+- 必须使用域名 + Authelia 双因素，以及已终结公网 TLS 的前置反代/Tunnel。
 
 ## 三种 Caddy 入口模式
 
-三个模式的内部链路完全相同：Caddy → Authelia（双因素）→ dsh，都只在宿主回环上互联。**唯一的区别是：谁来当公网入口、TLS 在哪里终结。**
+三个模式的内部链路完全相同：Caddy → Authelia（双因素）→ dsh；Caddy 到 Authelia/dsh 都走宿主回环。**唯一的区别是：谁来当公网入口、TLS 在哪里终结。**
 
 | | 1. 直连 80/443 | 2. 直连 443-only | 3. 前置反代/Tunnel |
 |---|---|---|---|
 | 公网入口 | NAS 上的 Caddy | NAS 上的 Caddy | lucky / CF Tunnel 等 |
 | 需要 NAS 有公网 IP | 是（IPv4 或 IPv6） | 是（IPv4 或 IPv6） | 否 |
-| 需要开放入站端口 | 80 + 443 | 仅 443 | 前置入口的端口（如 16666） |
+| 需要开放入站端口 | 80 + 443 | 仅 443 | DSH NAS 的 `13080` 仅允许 Lucky 来源；公网开放前置入口（如 16666） |
 | 证书由谁管 | Caddy 自动（ACME） | Caddy 自动（TLS-ALPN-01） | 前置入口 |
 | 访问地址 | `https://dsh.<domain>` | `https://dsh.<domain>` | `https://dsh.<domain>[:端口]` |
 
@@ -95,13 +95,15 @@ dsh 是能执行任意命令的 AI Agent，凭据一旦被拿走就是整台 NAS
 
 ### 3. 前置反代/Tunnel：`front-proxy`
 
-流量路径：`浏览器 →（公网）→ lucky/CF 等前置入口（在这里终结 TLS）→ NAS 内部 127.0.0.1:13080 → Caddy → Authelia/dsh`
+流量路径：`浏览器 →（公网）→ lucky/CF 等前置入口（在这里终结 TLS）→ DSH NAS 的 Caddy 内部入口 → Authelia/dsh`
 
-- Caddy 不接触公网：`auto_https off`，只监听 `127.0.0.1:13080`；公网入口是 lucky、OpenResty、Cloudflare Tunnel 等
-- **NAS 不需要公网 IP，也不需要开放入站端口**（CF Tunnel 是纯出站连接；lucky 按自己的穿透/DDNS 方式工作）
-- 前置入口把 `dsh.<domain>` 和 `auth.<domain>` 都转发到 `http://127.0.0.1:13080`——后端地址必须是 127.0.0.1，不能填 NAS 局域网 IP；并设置 `X-Forwarded-Proto: https`
-- 前置入口必须与 Caddy 同机且能访问宿主回环（host 网络；bridge 容器里的 `127.0.0.1` 不是宿主机）；非回环 listener 会硬失败
-- 前置监听的非标端口（如 16666）会写进 Authelia URL 和访问地址
+- Caddy 不接触公网：`auto_https off`，同机模式监听 `127.0.0.1:13080`；跨机模式监听 DSH NAS 的具体局域网地址（例如 `192.168.123.131:13080`）
+- 同机 Lucky 后端填 `http://127.0.0.1:13080`；跨机 Lucky 后端填 `http://192.168.123.131:13080`
+- 跨机模式的 Caddy `auth` 与 `dsh` 两个站点都用 `remote_ip` 仅允许 Lucky 的实际 TCP 来源（例如 `192.168.123.1`），并且 NAS 防火墙只允许该来源访问 TCP 13080；禁止使用 X-Forwarded-For 作为 ACL
+- Lucky 的公网 HTTPS 由 Lucky 终结；Lucky→Caddy 默认是明文 HTTP，因此必须确保局域网可信，敏感环境应改用加密的内部链路
+- **NAS 不需要公网 IP**，但跨机模式需要开放受限的入站 TCP 13080；CF Tunnel 纯出站时仍可使用同机回环模式
+- 两个前置入口都要把 `dsh.<domain>` 和 `auth.<domain>` 转发到 Caddy，并设置 `X-Forwarded-Proto: https`
+- 前置监听的非标公网端口（如 16666）会写进 Authelia URL 和访问地址
 
 选择顺序：有公网 IP 且 80/443 都空闲 → 模式 1；有公网 IP 但 80 不可用 → 模式 2；没有公网 IP，或 NAS 上已经有 lucky/CF 入口 → 模式 3。
 
@@ -206,15 +208,18 @@ sudo ./deploy.sh --latest     # 不询问，直接查询 npm latest，更新版�
 
 ## 前置反代配置要点
 
-以同机 lucky 为例：
+以 Lucky 在 `192.168.123.1`、DSH NAS 在 `192.168.123.131` 为例：
 
-1. 配置公网 HTTPS listener 和证书；
-2. `dsh.<domain>` 和 `auth.<domain>` 都转发到 `http://127.0.0.1:13080`；后端地址必须是 `127.0.0.1`，不能填 NAS 局域网 IP——Caddy 只监听回环，这是防止局域网绕过认证直连的边界。lucky 需以 host 网络运行才能访问宿主回环；
-3. dsh 规则开启 WebSocket；
-4. 两条规则都设置 `X-Forwarded-Proto: https`；
-5. 向导中的公网端口与 lucky 实际监听端口一致。
+1. 在 Lucky 配置公网 HTTPS listener 和证书；
+2. `dsh.<domain>` 和 `auth.<domain>` 都转发到 `http://192.168.123.131:13080`；不要填 DSH 的 `3080`；
+3. DSH 配置向导选择“前置反代”→“Lucky 在其它机器”，Caddy 监听 `192.168.123.131:13080`，来源限制填写 `192.168.123.1`；
+4. DSH NAS 防火墙只允许 `192.168.123.1 → 192.168.123.131:13080/TCP`，拒绝其它来源；
+5. dsh 规则开启 WebSocket；
+6. 两条规则都设置 `X-Forwarded-Proto: https`；
+7. 向导中的公网端口与 Lucky 实际监听端口一致；
+8. Caddy 使用 `remote_ip` 检查 Lucky 的直接 TCP 对端，不使用 `client_ip`、X-Forwarded-For、PROXY protocol 做来源 ACL。
 
-Cloudflare Tunnel 等容器化前置入口需使用 host 网络或明确的宿主访问方式；bridge 网络中的 `127.0.0.1:13080` 指向前置容器自身。
+如果 Lucky 与 DSH 同机，则选择同机模式并使用 `http://127.0.0.1:13080`。跨机 Lucky→Caddy 默认是明文 HTTP，必须确保局域网可信；需要加密时应在网络层提供隔离或加密链路。
 
 ## 使用与运维
 
@@ -239,8 +244,8 @@ docker compose restart dsh
 | 配置向导拒绝继续 | 检查域名、密钥、用户哈希和 Caddyfile 模式标记；必要时 `./deploy.sh --setup`。 |
 | 80 被占用 | 443 空闲选 443-only；443 也被占用选前置反代模式。 |
 | 443-only 证书申请失败 | 检查 A/AAAA、IPv6 防火墙和 443 可达性；看 `docker compose logs caddy`。 |
-| 前置反代 502 /「后端访问被拒绝」 | lucky/CF 的后端地址必须填 `http://127.0.0.1:13080`，**不能填 NAS 局域网 IP**——Caddy 只监听回环（旧版绑 0.0.0.0，局域网 IP 曾经可用，从旧版升级后必须改）。dsh 和 auth 两条规则都要指到这个地址。 |
-| 部署报告 Caddy 非回环 listener | 检查 Caddyfile 的 `default_bind 127.0.0.1`。 |
+| 前置反代 502 /「后端访问被拒绝」 | 同机 Lucky 后端填 `http://127.0.0.1:13080`；跨机 Lucky 后端填 DSH NAS 的 `http://192.168.123.131:13080`，**不能填 DSH 的 3080**。同时检查 Lucky 的实际来源 IP、Caddy `remote_ip` ACL 和 NAS 防火墙。 |
+| 部署报告 Caddy listener 或 ACL 不符合预期 | 同机检查 `default_bind 127.0.0.1`；跨机检查 `default_bind 192.168.123.131`、两个站点的 `remote_ip 192.168.123.1` 和 TCP 13080 防火墙规则；不要使用 X-Forwarded-For/client_ip 做 ACL。 |
 | 未登录 401 或跳转循环 | 检查 Authelia URL、cookie domain、`X-Forwarded-Proto` 和 `forward_auth` 块。 |
 | dsh 反复重启或 profiles 不可写 | `sudo chown -R 1000:1000 data/dsh data/workspace`，确认挂载在可写本地目录。 |
 | 模型请求超时 | 检查 `DSH_PROXY`、代理监听地址和 `docker compose logs dsh`。 |
@@ -251,7 +256,7 @@ docker compose restart dsh
 
 - 不要把 3080 暴露到局域网或公网；dsh 没有独立认证层。
 - 不要给 dsh 容器挂载 Docker socket。
-- 公网 TLS 必须由 Caddy 直连模式或同机前置代理/Tunnel 终结。
+- 公网 TLS 必须由 Caddy 直连模式或前置代理/Tunnel 终结；跨机 Lucky→Caddy 的明文 HTTP 仅适用于可信局域网。
 - 443-only 不会自动把 HTTP 跳转到 HTTPS；使用正确的 `https://` URL。
 
 ## 目录结构

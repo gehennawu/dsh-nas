@@ -2,9 +2,11 @@
 #
 # 仅支持域名 + Authelia；无域名 Basic Auth 模式已删除。
 # 向导生成的活跃配置首行会写入 dsh-nas-entry-mode 标记，供 deploy.sh 精确恢复入口模式。
-# 拓扑（三个容器都用 host 网络，127.0.0.1 即 NAS 宿主本身）：
-#   浏览器 ── https://dsh.example.com ──> Caddy ──(forward_auth)──> Authelia(127.0.0.1:9091)
-#                                                  └──> dsh(127.0.0.1:3080)
+# 拓扑（三个容器都用 host 网络，127.0.0.1 即 DSH NAS 宿主本身）：
+#   浏览器 ── HTTPS ──> Lucky（可与 DSH 同机，也可在其它机器）
+#       └─ HTTP ──> Caddy（DSH NAS 的内部入口）
+#                    ├── forward_auth ──> Authelia(127.0.0.1:9091)
+#                    └── reverse_proxy ──> dsh(127.0.0.1:3080)
 #
 # 本文件为占位模板：直接运行 ./deploy.sh，配置向导会自动改写（备份 .bak）；
 # 也可手动编辑后运行（脚本检测到占位符已替换即跳过向导）。
@@ -16,9 +18,10 @@
 #   模式 2「Caddy 直连 80/443」：域名直指 NAS，放行 80 和 443；
 #         保留 HTTP→HTTPS 跳转，也可使用 ACME HTTP-01。
 #   模式 3「前置反代 / Tunnel」：公网 TLS 由 lucky/CF Tunnel 等前置反代终结，
-#         Caddy 转内部 http（auto_https off + http_port 13080 + default_bind 127.0.0.1），
-#         并强制 X-Forwarded-Proto: https 告知 Authelia 原始协议。
-#         lucky/CF 的监听端口（如 16666）会写进所有公网 URL。
+#         Caddy 转内部 http（auto_https off + http_port 13080）。同机 Lucky 时绑定
+#         127.0.0.1；跨机 Lucky 时绑定 DSH NAS 的具体局域网 IP，并用 remote_ip
+#         只允许 Lucky 的实际 TCP 来源（不要用 X-Forwarded-For 做 ACL）。
+#         lucky/CF 的监听端口（如 16666）会写进所有公网 URL；跨机 HTTP 链路要求局域网可信。
 # ============================================================
 
 # ============================================================
@@ -81,33 +84,49 @@
 # ============================================================
 # 模式 3（lucky / CF Tunnel 反代入口，Caddy 内部 http）— 由向导按选择生成
 # ============================================================
+# 同机示例：default_bind 127.0.0.1，Lucky 后端 http://127.0.0.1:13080
+# 跨机示例：default_bind 192.168.123.131，Lucky 后端 http://192.168.123.131:13080；
+#           两个站点均需 remote_ip 192.168.123.1 + 403 fallback，NAS 防火墙同步限制来源。
+# 不要使用 client_ip/X-Forwarded-For/PROXY protocol 作为该 ACL。
 # {
 #     auto_https off
 #     http_port 13080
-#     default_bind 127.0.0.1
+#     default_bind 192.168.123.131
 # }
 #
-# http://auth.example.com {
-#     reverse_proxy 127.0.0.1:9091 {
-#         header_up X-Forwarded-Proto https
+# http://auth.example.com:13080 {
+#     @lucky remote_ip 192.168.123.1
+#     handle @lucky {
+#         reverse_proxy 127.0.0.1:9091 {
+#             header_up X-Forwarded-Proto https
+#         }
+#     }
+#     handle {
+#         respond "Forbidden" 403
 #     }
 # }
 #
-# http://dsh.example.com {
-#     forward_auth 127.0.0.1:9091 {
-#         uri /api/authz/forward-auth?authelia_url=https://auth.example.com
-#         copy_headers Remote-User Remote-Groups Remote-Email Remote-Name
-#         header_up X-Forwarded-Proto https
-#         @authfail {
-#             status 401
+# http://dsh.example.com:13080 {
+#     @lucky remote_ip 192.168.123.1
+#     handle @lucky {
+#         forward_auth 127.0.0.1:9091 {
+#             uri /api/authz/forward-auth?authelia_url=https://auth.example.com
+#             copy_headers Remote-User Remote-Groups Remote-Email Remote-Name
+#             header_up X-Forwarded-Proto https
+#             @authfail {
+#                 status 401
+#             }
+#             handle_response @authfail {
+#                 redir {http.response.header.Location} 302
+#             }
 #         }
-#         handle_response @authfail {
-#             redir {http.response.header.Location} 302
+#         reverse_proxy 127.0.0.1:3080 {
+#             header_up Host 127.0.0.1:3080
+#             header_up Origin http://127.0.0.1:3080
+#             header_up X-Forwarded-Proto https
 #         }
 #     }
-#     reverse_proxy 127.0.0.1:3080 {
-#         header_up Host 127.0.0.1:3080
-#         header_up Origin http://127.0.0.1:3080
-#         header_up X-Forwarded-Proto https
+#     handle {
+#         respond "Forbidden" 403
 #     }
 # }
