@@ -26,6 +26,26 @@ v0.1.2-alpha.1 起，dsh 在应用层加了浏览器会话认证（官方发布�
 
 ## 阶段 0：现在就做（无需等新版）
 
+### 拉包与配置保护（老用户必读）
+
+```sh
+# 首次拿包（还没有仓库副本时）：
+git clone https://github.com/gehennawu/dsh-nas.git /path/to/dsh-nas
+
+# 老用户拉包（已有部署）：第一次先标记本地配置文件为「受保护」，
+# 此后 git pull 永不覆盖、也不会因上游模板变化报冲突：
+cd /path/to/dsh-nas
+git update-index --skip-worktree caddy/Caddyfile authelia/configuration.yml authelia/users_database.yml
+git pull
+```
+
+要点：
+
+- `.env`、`data/`、`caddy/data/`、`authelia/data/` 本来就在 `.gitignore`（未跟踪），`git pull` 碰不到；
+- `--skip-worktree` 只做一次；覆盖的是「向导/部署生成、每台 NAS 都不同的本地配置」——Caddyfile 与 Authelia 域名/密码等永久归你所有；
+- Dockerfile 由 `deploy.sh` 管理（每次部署写回你选的 dsh 版本）。若未来 `git pull` 提示 Dockerfile 本地冲突，先接受上游版本再重跑升级（会自动写回所选版本）：
+  `git checkout -- Dockerfile && sudo ./deploy.sh --upgrade`
+
 ```sh
 # 可选：调整会话 cookie 有效期（正整数天；空 = dsh 默认 30 天）
 sudo ./deploy.sh --cookie-max-age 90
@@ -41,8 +61,13 @@ docker compose up -d dsh          # 重建容器生效，不用重新构建镜�
 **前置确认：版本必须已在 npm 发布。** `dsh-v0.1.2-alpha.1` 目前只有 GitHub release，npm `latest` 仍是 `0.1.1-rc.2`（Dockerfile 从 npm 安装，发布前升级引导里选不到）。等到 npm 发布后再执行：
 
 ```sh
-sudo ./deploy.sh --upgrade    # 交互选择 dsh 版本后重建
-sudo ./deploy.sh --latest     # 不询问，直接取 npm latest
+# 老用户完整命令（保护配置已在阶段 0 做过一次；未做过先回去执行）
+cd /path/to/dsh-nas && git pull
+sudo ./deploy.sh --upgrade                 # 交互选择 dsh 版本后重建
+# 或带设置一次到位：升级 + cookie 有效期 365 天（--upgrade 不会询问有效期）
+sudo ./deploy.sh --upgrade --cookie-max-age 365
+# 或不想交互：
+sudo ./deploy.sh --latest --cookie-max-age 365   # 直接取 npm latest
 ```
 
 升级机制（仓库原有能力）：root-only 事务快照 + 升级锁；构建/启动/健康/listener 校验失败自动恢复旧版本文件、旧镜像和旧 dsh 服务；构建前会再次询问 trusted-domain patch、`--cookie-max-age` 沿用 `.env` 已保存值不重复打扰。
