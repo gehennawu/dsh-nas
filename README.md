@@ -177,6 +177,7 @@ sudo ./deploy.sh --latest     # 不询问，直接查询 npm latest，更新版�
 ./deploy.sh --setup                          # 重新选择域名、入口或密码
 ./deploy.sh --cookie-max-age 90              # dsh Web 会话 cookie 有效期（天；写入 .env，无需重建镜像）
 ./deploy.sh url                              # 打印容器日志中最新一条 dsh web 启动 URL（新版含一次性 token）
+sudo ./deploy.sh update-script               # 升级本脚本（git 快进拉取；自动保护本地配置与 Dockerfile 版本）
 ```
 
 ## v0.1.2+ 浏览器一次性 token 认证与维护

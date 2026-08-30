@@ -32,17 +32,16 @@ v0.1.2-alpha.1 起，dsh 在应用层加了浏览器会话认证（官方发布�
 # 首次拿包（还没有仓库副本时）：
 git clone https://github.com/gehennawu/dsh-nas.git /path/to/dsh-nas
 
-# 老用户拉包（已有部署）：第一次先标记本地配置文件为「受保护」，
-# 此后 git pull 永不覆盖、也不会因上游模板变化报冲突：
-cd /path/to/dsh-nas
-git update-index --skip-worktree caddy/Caddyfile authelia/configuration.yml authelia/users_database.yml
-git pull
+# 老用户拉包（已有部署）：一键升级本脚本，自动保护本地配置——
+sudo ./deploy.sh update-script
 ```
+
+`update-script` 内部自动完成：保护 `caddy/Caddyfile`、`authelia/*.yml`（skip-worktree，幂等）→ 快进拉取远端 main → 保留 Dockerfile 锁定的 dsh 版本选择。脚本版本过旧（无 `update-script` 命令）时，手动执行一次：`git pull`（首次部署建议先 `git update-index --skip-worktree caddy/Caddyfile authelia/configuration.yml authelia/users_database.yml`），之后就能用自升级。
 
 要点：
 
 - `.env`、`data/`、`caddy/data/`、`authelia/data/` 本来就在 `.gitignore`（未跟踪），`git pull` 碰不到；
-- `--skip-worktree` 只做一次；覆盖的是「向导/部署生成、每台 NAS 都不同的本地配置」——Caddyfile 与 Authelia 域名/密码等永久归你所有；
+- `update-script` 保护的「向导/部署生成、每台 NAS 都不同的本地配置」——Caddyfile 与 Authelia 域名/密码等永久归你所有；
 - Dockerfile 由 `deploy.sh` 管理（每次部署写回你选的 dsh 版本）。若未来 `git pull` 提示 Dockerfile 本地冲突，先接受上游版本再重跑升级（会自动写回所选版本）：
   `git checkout -- Dockerfile && sudo ./deploy.sh --upgrade`
 
@@ -61,8 +60,8 @@ docker compose up -d dsh          # 重建容器生效，不用重新构建镜�
 **前置确认：版本必须已在 npm 发布。** `dsh-v0.1.2-alpha.1` 目前只有 GitHub release，npm `latest` 仍是 `0.1.1-rc.2`（Dockerfile 从 npm 安装，发布前升级引导里选不到）。等到 npm 发布后再执行：
 
 ```sh
-# 老用户完整命令（保护配置已在阶段 0 做过一次；未做过先回去执行）
-cd /path/to/dsh-nas && git pull
+# 老用户完整命令（保护配置/自升级在阶段 0；脚本旧则先手动 git pull 一次）
+cd /path/to/dsh-nas && sudo ./deploy.sh update-script
 sudo ./deploy.sh --upgrade                 # 交互选择 dsh 版本后重建
 # 或带设置一次到位：升级 + cookie 有效期 365 天（--upgrade 不会询问有效期）
 sudo ./deploy.sh --upgrade --cookie-max-age 365
