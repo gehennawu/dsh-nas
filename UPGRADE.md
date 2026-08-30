@@ -36,7 +36,7 @@ git clone https://github.com/gehennawu/dsh-nas.git /path/to/dsh-nas
 sudo ./deploy.sh update-script
 ```
 
-`update-script` 内部自动完成：保护 `caddy/Caddyfile`、`authelia/*.yml`（skip-worktree，幂等）→ 快进拉取远端 main → 保留 Dockerfile 锁定的 dsh 版本选择。脚本版本过旧（无 `update-script` 命令）时，手动执行一次：`git pull`（首次部署建议先 `git update-index --skip-worktree caddy/Caddyfile authelia/configuration.yml authelia/users_database.yml`），之后就能用自升级。
+`update-script` 内部自动完成：保护 `caddy/Caddyfile`、`authelia/*.yml`（skip-worktree，幂等）→ 快进拉取远端 main → 保留 Dockerfile 锁定的 dsh 版本选择。**只手动替换 deploy.sh 也可以**（脚本会把整个包按远端更新，受保护配置不受影响）；但 NAS 上的项目目录必须是用 `git clone` 部署的（有 `.git`）。脚本版本过旧（无 `update-script` 命令）时，手动执行一次 `git pull`，之后就能用自升级。
 
 要点：
 
