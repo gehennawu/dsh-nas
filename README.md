@@ -185,8 +185,8 @@ dsh v0.1.2-alpha.1 起，Web 界面接入应用层浏览器会话认证（对应
 
 - 每个 dsh 进程生成随机启动令牌；`dsh web` 启动时打印一次带 `?token=…` 的 URL。首次打开该 URL 会签发一个 30 天（可配）签名 cookie 并 303 跳回干净地址；此后所有 Web 会话（含 `/api` RPC）都要求该 cookie，缺失/过期一律 401。Authelia 双因素层不受影响，仍在其前端。
 - **必须的配套改动**：compose 健康检查已改为「任何 HTTP 响应都算存活」（未带 cookie 的 `/` 返回 401 是正常行为，不再导致 unhealthy）。
-- **每月/续期操作**：cookie 密钥持久化在 `data/dsh/.credentials.yaml`，重启/重建不影响已签发 cookie；过期后执行 `./deploy.sh url`，复制输出中的 `https://dsh.example.com/?token=…` 在浏览器打开即可（自动 303 回干净地址，cookie 重新起算）。多个浏览器各自独立持 cookie、独立起算；无痕窗口关闭即失效。
-- **调整有效期**：`./deploy.sh --setup` 向导会询问，或直接 `--cookie-max-age DAYS`；保存在 `.env` 的 `DSH_COOKIE_MAX_AGE_DAYS`，容器 entrypoint 据此生成 `--patch` overlay（覆盖 connection 行 `cookieMaxAgeDays`），**不需要重建镜像**，`docker compose up -d dsh` 重建容器即生效。留空 = dsh 默认 30 天。
+- **每月/续期操作**：cookie 密钥持久化在 `data/dsh/.credentials.yaml`，重启/重建不影响已签发 cookie；过期后取令牌有两种方式——SSH 执行 `./deploy.sh url`，或直接看 NAS 官方 Docker 管理界面里 dsh 容器日志的 `dsh web:` 行；复制 `?token=` 段拼成 `https://dsh.example.com/?token=…` 在浏览器打开即可（自动 303 回干净地址，cookie 重新起算）。多个浏览器各自独立持 cookie、独立起算；无痕窗口关闭即失效。
+- **调整有效期**：`./deploy.sh --setup` 向导会询问，或直接 `--cookie-max-age DAYS`；保存在 `.env` 的 `DSH_COOKIE_MAX_AGE_DAYS`，容器 entrypoint 据此生成 `--patch` overlay（覆盖 connection 行 `cookieMaxAgeDays`），**不需要重建镜像**，`docker compose up -d dsh` 重建容器即生效。留空 = dsh 默认 30 天。**改时长只对新签发的 cookie 生效**，已有浏览器需重新打开一次 token URL 才能拿到新时长。
 - **trusted-domain patch 仍保留**：客户端 `connection.isLoopback` 依旧只看页面 hostname，设置页持久化与「在 NAS 上打开文件」等特权面仍依赖 `DSH_TRUSTED_DOMAIN` patch；该 patch 与一次性 token 认证互不冲突（认证在全域生效，patch 只影响浏览器权限面判定）。
 - 升级到该版本前请确认：dsh 版本需已在 npm 发布（当前 npm `latest` 仍是 `0.1.1-rc.2`；GitHub release `dsh-v0.1.2-alpha.1` 已存在但未发布到 npm，Dockerfile 的 npm 安装方式暂时选不到）。
 
