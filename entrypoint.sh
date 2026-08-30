@@ -10,7 +10,10 @@
 #    deploy.sh 启动后会验证实际绑定地址。
 # 3) 可选：DSH_TRUSTED_HOSTS 追加 --trusted-host（默认方案由 Caddy 改写
 #    Host 头绕过信任栅栏，不需要；仅在直连 3080 或透传真实 Host 时才需要）。
-# 4) rc8+ 的反向代理 trusted-domain 兼容 patch 在 Dockerfile 构建阶段应用；
+# 4) 可选：DSH_COOKIE_MAX_AGE_DAYS 为 dsh Web 浏览器会话 cookie 有效期（正整数天数；
+#    空值用 dsh 默认 30）。v0.1.2+ 一次性 token 认证签发该 cookie；这里按配置生成
+#    --patch overlay 覆盖 connection 行，无需修改镜像。
+# 5) rc8+ 的反向代理 trusted-domain 兼容 patch 在 Dockerfile 构建阶段应用；
 #    运行容器保持 node(1000)，不修改 /usr/local/lib/node_modules。
 set -e
 
@@ -53,4 +56,31 @@ if [ -n "${DSH_TRUSTED_HOSTS:-}" ]; then
   IFS="$old_ifs"
 fi
 
-exec dsh web --host 127.0.0.1 $trusted_args "$@"
+# DSH_COOKIE_MAX_AGE_DAYS → 生成 connection 行 overlay（--patch 只在根 profile 层之后追加，
+# 覆盖同名行的 config；必须重述 webRuntime.trustedHosts 表达式，否则该行会回落为空列表）。
+patch_args=""
+if [ -n "${DSH_COOKIE_MAX_AGE_DAYS:-}" ]; then
+  case "$DSH_COOKIE_MAX_AGE_DAYS" in
+    ''|*[!0-9]*)
+      echo "dsh-entrypoint: FATAL DSH_COOKIE_MAX_AGE_DAYS 必须是正整数天数，实际为: $DSH_COOKIE_MAX_AGE_DAYS" >&2
+      exit 1 ;;
+  esac
+  if [ "$DSH_COOKIE_MAX_AGE_DAYS" -lt 1 ] || [ "$DSH_COOKIE_MAX_AGE_DAYS" -gt 3650 ] 2>/dev/null; then
+    echo "dsh-entrypoint: FATAL DSH_COOKIE_MAX_AGE_DAYS 超出范围（1–3650）: $DSH_COOKIE_MAX_AGE_DAYS" >&2
+    exit 1
+  fi
+  patch_file="$DSH_HOME/web-cookie-max-age.yml"
+  {
+    echo "# dsh-nas: browser-session cookie max age overlay（entrypoint.sh 生成，勿手改）"
+    echo "- id: connection"
+    echo "  config:"
+    echo "    trustedHosts: !!js ctx.webRuntime.trustedHosts"
+    echo "    cookieMaxAgeDays: $DSH_COOKIE_MAX_AGE_DAYS"
+  } > "$patch_file" || {
+    echo "dsh-entrypoint: FATAL 无法写入 $patch_file" >&2
+    exit 1
+  }
+  patch_args="--patch $patch_file"
+fi
+
+exec dsh web --host 127.0.0.1 $trusted_args $patch_args "$@"

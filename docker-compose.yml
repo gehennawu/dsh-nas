@@ -43,6 +43,9 @@ services:
       - HTTP_PROXY=${DSH_PROXY-http://127.0.0.1:7890}
       - HTTPS_PROXY=${DSH_PROXY-http://127.0.0.1:7890}
       - NO_PROXY=127.0.0.1,localhost  # 本地流量不走代理；连局域网 Ollama 时把其 IP 追加进来
+      # dsh Web 浏览器会话 cookie 有效期（天；空 = dsh 默认 30 天）。
+      # v0.1.2+ 一次性 token 认证签发该 cookie；entrypoint.sh 据此生成 --patch overlay。
+      - DSH_COOKIE_MAX_AGE_DAYS=${DSH_COOKIE_MAX_AGE_DAYS:-}
     volumes:
       # DSH 数据（配置/凭据/会话/存储），属主 UID 1000
       - ./data/dsh:/home/node/.dsh
@@ -51,7 +54,9 @@ services:
     restart: unless-stopped
     logging: *default-logging
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3080').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      # v0.1.2+ 起未带 cookie 的 GET / 一律返回 401（一次性 token 认证）——健康检查
+      # 只验证「服务已响应」，任何 HTTP 状态码（200/401/403…）都算存活；fetch 拒绝才失败。
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3080').then(()=>process.exit(0)).catch(()=>process.exit(1))"]
       interval: 30s
       timeout: 5s
       retries: 3

@@ -26,6 +26,10 @@ SKIP_BUILD=0
 SETUP_FORCE=0
 SETUP_WIZARD_RAN=0
 DSH_TRUSTED_DOMAIN_CHANGED=0
+COOKIE_MAX_AGE_ARG=0
+COOKIE_MAX_AGE_ARG_VALUE=""
+DSH_COOKIE_MAX_AGE_DAYS=""
+DSH_COOKIE_MAX_AGE_CHANGED=0
 UPGRADE_MODE=0
 LATEST_MODE=0
 UPGRADE_ROLLBACK_ARMED=0
@@ -100,11 +104,33 @@ usage() {
   echo "  --upgrade           升级模式：跳过 Caddy/Authelia 向导，但仍询问是否启用/更新 dsh 域名 patch"
   echo "  --latest            自动升级到 npm 最新版：查询 @deepseek-ai/dsh latest，更新版本号后"
   echo "                      构建（隐含 --upgrade；需已完成一次正常部署；仍询问 patch）"
+  echo "  --cookie-max-age DAYS"
+  echo "                      dsh Web 浏览器会话 cookie 有效期（正整数天数）。v0.1.2+ 一次性 token"
+  echo "                      认证用它签发 cookie（默认 30 天）；写入 .env 的 DSH_COOKIE_MAX_AGE_DAYS，"
+  echo "                      entrypoint 生成 --patch overlay，无需改镜像"
+  echo ""
+  echo "  ./deploy.sh url     打印容器日志中最新一条 dsh web 启动 URL（v0.1.2+ 含一次性 token，"
+  echo "                      浏览器打开即完成/续期会话 cookie；token 属敏感信息）"
   echo ""
   echo "交互构建前会询问要安装的 dsh 版本：Dockerfile 锁定版（默认）/ npm latest"
   echo "正式版 / npm next 预览版，选择后写入 Dockerfile；--skip-build 不构建不询问，"
   echo "--latest 已自动选定 latest 不再询问"
 }
+
+# ---------- ./deploy.sh url：打印最新一条 dsh web 启动 URL ----------
+if [ "${1:-}" = "url" ]; then
+  if [ $# -ne 1 ]; then echo "错误: url 不接受其它参数"; exit 1; fi
+  line=$(docker logs dsh 2>/dev/null | grep 'dsh web:' | tail -n 1)
+  if [ -z "$line" ]; then
+    echo "未找到 dsh web 启动 URL；容器 dsh 可能未运行或日志为空。"
+    echo "首次部署请先运行: $0"
+    exit 1
+  fi
+  echo "$line"
+  echo "提示: v0.1.2-alpha.1+ 该 URL 带一次性 token（属敏感信息，勿外传）；"
+  echo "      浏览器打开后自动签发/续期会话 cookie（默认 30 天，可用 --cookie-max-age 调整）。"
+  exit 0
+fi
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -115,6 +141,9 @@ while [ $# -gt 0 ]; do
     --proxy-host)
       [ $# -ge 2 ] || { echo "错误: --proxy-host 需要一个地址（如 192.168.1.5:7890）"; exit 1; }
       PROXY="http://$2"; SET_PROXY_ARG=1; shift ;;
+    --cookie-max-age)
+      [ $# -ge 2 ] || { echo "错误: --cookie-max-age 需要一个正整数天数"; exit 1; }
+      COOKIE_MAX_AGE_ARG=1; COOKIE_MAX_AGE_ARG_VALUE="$2"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "未知参数: $1"; usage; exit 1 ;;
   esac
@@ -206,6 +235,13 @@ valid_trusted_domain() { # $1=hostname
   local domain="$1"
   [ -n "$domain" ] || return 0
   [[ "$domain" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]]
+}
+
+valid_cookie_max_age() { # $1=天数；空值 = 关闭（用 dsh 默认 30 天）
+  local days="$1"
+  [ -n "$days" ] || return 0
+  [[ "$days" =~ ^[0-9]+$ ]] || return 1
+  [ "$days" -ge 1 ] && [ "$days" -le 3650 ] 2>/dev/null
 }
 
 valid_ipv4() { # $1=IPv4 address
@@ -369,6 +405,46 @@ persist_trusted_domain() {
   if [ "$DSH_TRUSTED_DOMAIN_CHANGED" -eq 1 ] || ! grep -q '^DSH_TRUSTED_DOMAIN=' "$ENV_FILE" 2>/dev/null; then
     env_upsert DSH_TRUSTED_DOMAIN "$DSH_TRUSTED_DOMAIN" || return 1
     ok "已保存 DSH_TRUSTED_DOMAIN=${DSH_TRUSTED_DOMAIN:-（未启用 patch）}"
+  fi
+}
+
+# ---------- dsh Web 浏览器会话 cookie 有效期（v0.1.2+ 一次性 token 认证） ----------
+# DSH_COOKIE_MAX_AGE_DAYS 空值 = 用 dsh 默认 30 天；非空正整数由 entrypoint.sh
+# 生成 --patch overlay 覆盖 connection 行，无需重新构建镜像。
+configure_cookie_max_age() { # $1=已保存天数（可为空）
+  local saved="$1" answer="" days=""
+  if [ ! -t 0 ]; then
+    fail "DSH cookie 有效期选择需要交互终端；请在 SSH 终端运行，或用 --cookie-max-age DAYS 参数"
+    return 1
+  fi
+
+  DSH_COOKIE_MAX_AGE_CHANGED=0
+  echo
+  echo "  dsh Web 浏览器会话 cookie 有效期（v0.1.2+ 一次性 token 签发，默认 30 天）"
+  if [ -n "$saved" ]; then
+    printf "  当前 %s 天；回车保留，输入数字更换，输入 off 恢复 dsh 默认 30 天: " "$saved"
+  else
+    printf "  留空使用 dsh 默认 30 天，或输入天数（如 90）: "
+  fi
+  read_line answer || return 1
+  case "$answer" in
+    "") days="$saved" ;;
+    off|OFF|n|N) days="" ;;
+    *) days="$answer" ;;
+  esac
+  if ! valid_cookie_max_age "$days"; then
+    fail "无效 cookie 有效期: $answer（正整数天数，或留空/off）"
+    return 1
+  fi
+  DSH_COOKIE_MAX_AGE_DAYS="$days"
+  [ "$saved" = "$days" ] || DSH_COOKIE_MAX_AGE_CHANGED=1
+  ok "dsh 浏览器会话 cookie 有效期 = ${days:-dsh 默认 30 天}"
+}
+
+persist_cookie_max_age() {
+  if [ "$DSH_COOKIE_MAX_AGE_CHANGED" -eq 1 ] || ! grep -q '^DSH_COOKIE_MAX_AGE_DAYS=' "$ENV_FILE" 2>/dev/null; then
+    env_upsert DSH_COOKIE_MAX_AGE_DAYS "$DSH_COOKIE_MAX_AGE_DAYS" || return 1
+    ok "已保存 DSH_COOKIE_MAX_AGE_DAYS=${DSH_COOKIE_MAX_AGE_DAYS:-（空 = dsh 默认 30 天）}"
   fi
 }
 
@@ -971,6 +1047,7 @@ ENV_FILE="$SCRIPT_DIR/.env"
 SAVED_PROXY=""
 SAVED_PROXY_KEY_EXISTS=0
 SAVED_TRUSTED_DOMAIN=""
+SAVED_COOKIE_MAX_AGE=""
 SAVED_FRONT_PROXY_BIND_ADDRESS=""
 SAVED_FRONT_PROXY_SOURCE_IP=""
 FRONT_PROXY_BIND_COUNT=0
@@ -992,6 +1069,12 @@ if [ -f "$ENV_FILE" ]; then
     exit 1
   fi
   SAVED_TRUSTED_DOMAIN=$(sed -n 's/^DSH_TRUSTED_DOMAIN=//p' "$ENV_FILE" | head -n 1)
+  COOKIE_MAX_AGE_COUNT=$(grep -c '^DSH_COOKIE_MAX_AGE_DAYS=' "$ENV_FILE" 2>/dev/null || true)
+  if [ "$COOKIE_MAX_AGE_COUNT" -gt 1 ]; then
+    echo "错误: $ENV_FILE 中存在多个 DSH_COOKIE_MAX_AGE_DAYS，无法安全判断 cookie 有效期配置"
+    exit 1
+  fi
+  SAVED_COOKIE_MAX_AGE=$(sed -n 's/^DSH_COOKIE_MAX_AGE_DAYS=//p' "$ENV_FILE" | head -n 1)
   FRONT_PROXY_BIND_COUNT=$(grep -c '^FRONT_PROXY_BIND_ADDRESS=' "$ENV_FILE" 2>/dev/null || true)
   FRONT_PROXY_SOURCE_COUNT=$(grep -c '^FRONT_PROXY_SOURCE_IP=' "$ENV_FILE" 2>/dev/null || true)
   if [ "$FRONT_PROXY_BIND_COUNT" -gt 1 ] || [ "$FRONT_PROXY_SOURCE_COUNT" -gt 1 ]; then
@@ -1003,6 +1086,7 @@ if [ -f "$ENV_FILE" ]; then
 fi
 SAVED_PROXY="${SAVED_PROXY%$'\r'}"   # .env 被 Windows 编辑器存成 CRLF 时剥掉回车
 SAVED_TRUSTED_DOMAIN="${SAVED_TRUSTED_DOMAIN%$'\r'}"
+SAVED_COOKIE_MAX_AGE="${SAVED_COOKIE_MAX_AGE%$'\r'}"
 SAVED_FRONT_PROXY_BIND_ADDRESS="${SAVED_FRONT_PROXY_BIND_ADDRESS%$'\r'}"
 SAVED_FRONT_PROXY_SOURCE_IP="${SAVED_FRONT_PROXY_SOURCE_IP%$'\r'}"
 if [ -n "$SAVED_FRONT_PROXY_BIND_ADDRESS" ] && ! valid_front_bind_address "$SAVED_FRONT_PROXY_BIND_ADDRESS"; then
@@ -1017,7 +1101,12 @@ if ! valid_trusted_domain "$SAVED_TRUSTED_DOMAIN"; then
   echo "错误: $ENV_FILE 中的 DSH_TRUSTED_DOMAIN 无效: $SAVED_TRUSTED_DOMAIN（只允许 hostname，不含协议、端口或路径）"
   exit 1
 fi
+if ! valid_cookie_max_age "$SAVED_COOKIE_MAX_AGE"; then
+  echo "错误: $ENV_FILE 中的 DSH_COOKIE_MAX_AGE_DAYS 无效: $SAVED_COOKIE_MAX_AGE（正整数天数或空值）"
+  exit 1
+fi
 DSH_TRUSTED_DOMAIN="$SAVED_TRUSTED_DOMAIN"
+DSH_COOKIE_MAX_AGE_DAYS="$SAVED_COOKIE_MAX_AGE"
 FRONT_BIND_ADDRESS="${SAVED_FRONT_PROXY_BIND_ADDRESS:-127.0.0.1}"
 FRONT_PROXY_SOURCE_IP="${SAVED_FRONT_PROXY_SOURCE_IP:-}"
 if [ "$UPGRADE_MODE" -eq 1 ] && ! capture_upgrade_env_before_mutation; then
@@ -1757,6 +1846,22 @@ if [ "$UPGRADE_MODE" -eq 1 ] || [ "$SETUP_WIZARD_RAN" -eq 1 ]; then
     exit 1
   }
 fi
+# cookie 有效期独立于 Caddy/Authelia 向导：--cookie-max-age 参数在任何模式下生效；
+# 首次部署/--setup 时随向导询问一次；普通 --upgrade 不重复打扰（沿用 .env 已保存值）。
+if [ "$COOKIE_MAX_AGE_ARG" -eq 1 ]; then
+  if ! valid_cookie_max_age "$COOKIE_MAX_AGE_ARG_VALUE"; then
+    fail "无效 --cookie-max-age: $COOKIE_MAX_AGE_ARG_VALUE（正整数天数）"
+    exit 1
+  fi
+  DSH_COOKIE_MAX_AGE_DAYS="$COOKIE_MAX_AGE_ARG_VALUE"
+  DSH_COOKIE_MAX_AGE_CHANGED=1
+elif [ "$SETUP_WIZARD_RAN" -eq 1 ]; then
+  configure_cookie_max_age "$SAVED_COOKIE_MAX_AGE" || exit 1
+fi
+persist_cookie_max_age || {
+  fail "无法保存 DSH_COOKIE_MAX_AGE_DAYS 到 $ENV_FILE"
+  exit 1
+}
 if [ "$SETUP_WIZARD_RAN" -eq 1 ]; then
   persist_front_proxy_network || {
     fail "无法保存前置代理网络配置到 $ENV_FILE"
@@ -2351,6 +2456,7 @@ if [ "$FAIL" -eq 0 ]; then
   echo "  访问: ${C_B}$(pub_url "$DSH_DOMAIN")${C_0}"
   echo "  首次使用: 打开 $(pub_url "$AUTH_DOMAIN") 登录，按提示注册 TOTP（验证码见 authelia/data/notifications.txt）"
   echo "  常用: docker compose logs -f dsh | docker compose restart dsh（社区插件增删后同样需要重启）"
+  echo "  dsh Web 启动 URL（新版含一次性 token，浏览器打开即完成/续期会话）: $0 url"
 fi
 if [ "$FAIL" -gt 0 ] || [ "$UP_OK" -ne 1 ]; then
   echo "  ${C_R}部署流程结束，但有检查或启动失败；退出码置为 1，修复后重跑: $0${C_0}"
