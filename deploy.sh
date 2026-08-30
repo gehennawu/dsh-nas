@@ -111,6 +111,9 @@ usage() {
   echo ""
   echo "  ./deploy.sh url     打印容器日志中最新一条 dsh web 启动 URL（v0.1.2+ 含一次性 token，"
   echo "                      浏览器打开即完成/续期会话 cookie；token 属敏感信息）"
+  echo "  ./deploy.sh update-script"
+  echo "                      升级本脚本（git 拉取远端 main，只允许快进；自动保护 Caddyfile/"
+  echo "                      Authelia 配置与 Dockerfile 版本选择，不触碰 .env 与 data/）"
   echo ""
   echo "交互构建前会询问要安装的 dsh 版本：Dockerfile 锁定版（默认）/ npm latest"
   echo "正式版 / npm next 预览版，选择后写入 Dockerfile；--skip-build 不构建不询问，"
@@ -129,6 +132,55 @@ if [ "${1:-}" = "url" ]; then
   echo "$line"
   echo "提示: v0.1.2-alpha.1+ 该 URL 带一次性 token（属敏感信息，勿外传）；"
   echo "      浏览器打开后自动签发/续期会话 cookie（默认 30 天，可用 --cookie-max-age 调整）。"
+  exit 0
+fi
+
+# ---------- ./deploy.sh update-script：升级本脚本（只更新脚本文件，不碰任何配置） ----------
+if [ "${1:-}" = "update-script" ]; then
+  [ $# -eq 1 ] || { echo "错误: update-script 不接受其它参数"; exit 1; }
+  [ -d "$SCRIPT_DIR/.git" ] || {
+    echo "错误: $SCRIPT_DIR 不是 git 仓库（当初未用 git clone 部署？），无法自升级。"
+    echo "      请手动替换脚本文件，或改用它法：git clone https://github.com/gehennawu/dsh-nas.git"
+    exit 1
+  }
+  command -v git >/dev/null 2>&1 || { echo "错误: 未找到 git 命令（NAS 缺 git？）"; exit 1; }
+  cd "$SCRIPT_DIR" || exit 1
+
+  # 1) 保护向导/部署生成的本地配置（幂等；.env 与 data/ 本来就在 .gitignore）
+  git update-index --skip-worktree \
+    caddy/Caddyfile authelia/configuration.yml authelia/users_database.yml 2>/dev/null || true
+
+  # 2) 记录 Dockerfile 当前锁定的 dsh 版本（deploy.sh 部署时写入），拉取后写回
+  saved_version=$(sed -n 's/^ARG DSH_VERSION=//p' Dockerfile | head -n 1)
+
+  # 3) 拉取远端 main，只允许快进合并
+  if ! git fetch origin main >/dev/null 2>&1; then
+    echo "错误: git fetch 失败（网络/代理问题？）。可手动执行:"
+    echo "  cd $SCRIPT_DIR && git pull"
+    exit 1
+  fi
+  local_sha=$(git rev-parse HEAD)
+  remote_sha=$(git rev-parse FETCH_HEAD)
+  if [ "$local_sha" = "$remote_sha" ]; then
+    echo "脚本已是最新（$(git rev-parse --short HEAD)），无需更新"
+    exit 0
+  fi
+  echo "本地: $(git rev-parse --short "$local_sha") -> 远端: $(git rev-parse --short "$remote_sha")"
+  # Dockerfile 是 deploy.sh 所有（版本号），先丢弃本地改动避免冲突，版本号随后写回
+  git checkout -- Dockerfile 2>/dev/null || true
+  if ! git merge --ff-only FETCH_HEAD >/dev/null 2>&1; then
+    echo "错误: 本地 main 与远端分叉（本地有未推送提交？），无法快进合并。请手动处理:"
+    echo "  cd $SCRIPT_DIR && git pull --rebase"
+    exit 1
+  fi
+
+  # 4) 写回 dsh 版本选择（若上游仍保留该行）
+  if [ -n "$saved_version" ] && grep -q '^ARG DSH_VERSION=' Dockerfile; then
+    sed -i "s/^ARG DSH_VERSION=.*/ARG DSH_VERSION=$saved_version/" Dockerfile
+    echo "已保留 Dockerfile 锁定的 dsh 版本: $saved_version"
+  fi
+  echo "脚本已更新: $(git rev-parse --short HEAD)"
+  echo "接下来: sudo $0 --upgrade [--cookie-max-age DAYS] 完成部署升级"
   exit 0
 fi
 
