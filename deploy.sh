@@ -166,8 +166,14 @@ if [ "${1:-}" = "update-script" ]; then
     exit 0
   fi
   echo "本地: $(git rev-parse --short "$local_sha") -> 远端: $(git rev-parse --short "$remote_sha")"
-  # Dockerfile 是 deploy.sh 所有（版本号），先丢弃本地改动避免冲突，版本号随后写回
-  git checkout -- Dockerfile 2>/dev/null || true
+  # 包文件本地改动（如手动替换的 deploy.sh、deploy.sh 写入的 Dockerfile 版本）按远端覆盖；
+  # 受保护配置（Caddyfile/Authelia）已 skip-worktree，git checkout 不会触碰；
+  # .env 与 data/ 未被跟踪，天然安全。先列出将被回滚的改动再执行。
+  if [ -n "$(git status --porcelain)" ]; then
+    echo "以下包文件有本地改动，将按远端更新（受保护配置与 .env/data 不受影响）:"
+    git status --porcelain | sed 's/^/  /'
+    git checkout -- . 2>/dev/null || true
+  fi
   if ! git merge --ff-only FETCH_HEAD >/dev/null 2>&1; then
     echo "错误: 本地 main 与远端分叉（本地有未推送提交？），无法快进合并。请手动处理:"
     echo "  cd $SCRIPT_DIR && git pull --rebase"
