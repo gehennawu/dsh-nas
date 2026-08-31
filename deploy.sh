@@ -832,13 +832,20 @@ restore_upgrade_image() {
   [ "$(docker image inspect dsh:local --format '{{.Id}}' 2>/dev/null)" = "$UPGRADE_OLD_IMAGE_ID" ]
 }
 wait_for_stack_healthy() {
-  local i status authelia_status caddy_status
-  for i in $(seq 1 40); do
+  local i status authelia_status caddy_status dsh_state dsh_exit
+  for i in $(seq 1 80); do
     status=$(docker inspect -f '{{.State.Health.Status}}' dsh 2>/dev/null || echo missing)
     authelia_status=$(docker inspect -f '{{.State.Health.Status}}' authelia 2>/dev/null || echo missing)
     caddy_status=$(docker inspect -f '{{.State.Health.Status}}' dsh-caddy 2>/dev/null || echo missing)
     if [ "$status" = healthy ] && [ "$authelia_status" = healthy ] && [ "$caddy_status" = healthy ]; then
       return 0
+    fi
+    # 容器已退出（error/exited）时立即失败，避免干等：退出码与日志是根因证据
+    dsh_state=$(docker inspect -f '{{.State.Status}}' dsh 2>/dev/null || echo missing)
+    if [ "$dsh_state" != "running" ]; then
+      dsh_exit=$(docker inspect -f '{{.State.ExitCode}}' dsh 2>/dev/null || echo '?')
+      echo "  ${C_R}回滚健康状态: dsh 容器已退出（status=$dsh_state exit=$dsh_exit）；请运行 docker logs dsh 查看启动错误${C_0}"
+      return 1
     fi
     sleep 3
   done
@@ -2447,27 +2454,38 @@ else
   STATUS="starting"
   AUTHELIA_STATUS="starting"
   CADDY_STATUS="starting"
-  for i in $(seq 1 40); do
+  DSH_STATE=""
+  DSH_EXIT=""
+  # healthcheck 参数（interval 30s / start_period dsh 30s、authelia 60s）叠加后，
+  # 三者最坏可在 200s 左右才全部 healthy；120s 窗口会误杀正常启动，这里放宽到 240s。
+  for i in $(seq 1 80); do
     STATUS=$(docker inspect -f '{{.State.Health.Status}}' dsh 2>/dev/null || echo "starting")
     AUTHELIA_STATUS=$(docker inspect -f '{{.State.Health.Status}}' authelia 2>/dev/null || echo "starting")
     CADDY_STATUS=$(docker inspect -f '{{.State.Health.Status}}' dsh-caddy 2>/dev/null || echo "starting")
     [ "$STATUS" = "healthy" ] && [ "$AUTHELIA_STATUS" = "healthy" ] && [ "$CADDY_STATUS" = "healthy" ] && break
+    # 容器已退出（error/exited）时立即失败并给出退出码，不要白等；日志是根因证据
+    DSH_STATE=$(docker inspect -f '{{.State.Status}}' dsh 2>/dev/null || echo "missing")
+    if [ "$DSH_STATE" != "running" ]; then
+      DSH_EXIT=$(docker inspect -f '{{.State.ExitCode}}' dsh 2>/dev/null || echo '?')
+      fail "dsh 容器状态异常: ${DSH_STATE}（exit=$DSH_EXIT）；请运行 docker logs dsh 查看启动错误"
+      break
+    fi
     sleep 3
   done
   if [ "$STATUS" = "healthy" ]; then
     ok "dsh 健康检查通过"
   else
-    fail "dsh 未在 120 秒内 healthy；运行 docker compose logs dsh 排查"
+    fail "dsh 未在 240 秒内 healthy；运行 docker compose logs dsh 排查"
   fi
   if [ "$AUTHELIA_STATUS" = "healthy" ]; then
     ok "Authelia 容器健康检查通过"
   else
-    fail "Authelia 容器未在 120 秒内 healthy；运行 docker compose logs authelia 排查"
+    fail "Authelia 容器未在 240 秒内 healthy；运行 docker compose logs authelia 排查"
   fi
   if [ "$CADDY_STATUS" = "healthy" ]; then
     ok "Caddy 容器 healthcheck 通过"
   else
-    fail "Caddy 容器未在 120 秒内 healthy；运行 docker compose logs caddy 排查"
+    fail "Caddy 容器未在 240 秒内 healthy；运行 docker compose logs caddy 排查"
   fi
 
   # 安全验证：host 网络下 dsh 必须只绑定回环，否则局域网可绕过 Caddy+Authelia 直连
