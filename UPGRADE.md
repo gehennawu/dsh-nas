@@ -73,6 +73,19 @@ sudo ./deploy.sh --latest --cookie-max-age 365   # 直接取 npm latest
 
 升级机制（仓库原有能力）：root-only 事务快照 + 升级锁；构建/启动/健康/listener 校验失败自动恢复旧版本文件、旧镜像和旧 dsh 服务；`--latest`/`--alpha` 在快照后查询对应 dist-tag 并写入版本；构建前会再次询问 trusted-domain patch、`--cookie-max-age` 沿用 `.env` 已保存值不重复打扰。
 
+**升级前的插件兼容性检查（alpha/新版本必做）**：alpha.2 移除了 `@deepseek-ai/dsh-settings` 的 `settingsNamespace`、`installSettingsSection` 等导出，并重构了插件清单/Remote 契约。第三方插件若仍 import 这些旧导出，会在启动时抛 `The requested module '@deepseek-ai/dsh-settings' does not provide an export named ...`，导致 dsh 容器崩溃循环。升级前：
+
+```sh
+# 在宿主查看 web profile 启用了哪些第三方插件
+ls data/dsh/profiles/web/node_modules/ | grep -v '^\.' | grep '^[a-z]'
+# 逐个核对插件 dist-tag 是否声明兼容目标版本（npm 页面或：）
+npm view dsh-better-sidebar@alpha peerDependencies.@deepseek-ai/dsh-settings
+npm view dshmarket dist-tags
+```
+
+- 有适配版（如 `dsh-better-sidebar@0.18.0-alpha.0` 声明 `^0.1.2-alpha.2`）→ 先升级插件再升 dsh；
+- 无适配版 → 移除插件（`dsh plugin --profile web remove <pkg>`）或等作者更新后再升 dsh，避免容器启动失败。
+
 升级当天三件事：
 
 1. **健康检查**——已适配（见上表），无需手动处理。
