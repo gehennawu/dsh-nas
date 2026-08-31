@@ -103,7 +103,8 @@ usage() {
   echo "  --setup             强制重跑配置向导（可换域名/入口/密码；原文件备份为 .bak，Authelia 密钥保留）"
   echo "                      向导还会选择是否启用/更新 DSH 反代域名 patch，并保存 DSH_TRUSTED_DOMAIN"
   echo "                      前置反代可选择同机 Lucky 或跨机 Lucky（跨机时限制来源 IP）"
-  echo "  --upgrade           升级模式：跳过 Caddy/Authelia 向导，但仍询问是否启用/更新 dsh 域名 patch"
+  echo "  --upgrade           升级模式：跳过 Caddy/Authelia 向导，但仍询问是否启用/更新 dsh 域名 patch；"
+  echo "                      若 127.0.0.1:3080 被非预期进程/容器占用，会询问手动停止或由脚本自动停止"
   echo "  --latest            自动升级到 npm 最新正式版：查询 @deepseek-ai/dsh latest，更新版本号后"
   echo "                      构建（隐含 --upgrade；需已完成一次正常部署；仍询问 patch）"
   echo "  --alpha             自动升级到 npm alpha 预览版：查询 @deepseek-ai/dsh alpha，更新版本号后"
@@ -2253,6 +2254,86 @@ container_running() {
   docker ps --format '{{.Names}}' 2>/dev/null | grep -Fxq "$1"
 }
 
+# 识别 3080 占用者：host 网络下容器进程的 pid 会出现在 ss 中，
+# 优先匹配到容器，否则按宿主进程处理。stdout 输出人类可读描述。
+holder_info_3080() { # $1=pid
+  local pid="$1" c cp iname
+  for c in $(docker ps -q 2>/dev/null); do
+    cp=$(docker inspect -f '{{.State.Pid}}' "$c" 2>/dev/null || true)
+    if [ -n "$cp" ] && [ "$cp" = "$pid" ]; then
+      iname=$(docker inspect -f '{{.Name}}' "$c" 2>/dev/null | sed 's#^/##')
+      printf '容器 %s（pid=%s）' "${iname:-未知}" "$pid"
+      return 0
+    fi
+  done
+  printf '宿主进程 %s（pid=%s）' "$(ps -p "$pid" -o comm= 2>/dev/null || echo 未知)" "$pid"
+}
+
+# 升级模式：127.0.0.1:3080 被非预期进程/容器占用时，让用户选择
+# 手动停止占用者（重跑）或由脚本自动停止（容器 stop+rm、宿主进程 kill）。
+# 端口释放成功返回 0；用户选择手动或自动停止失败返回 1。
+handle_3080_conflict() { # $1=当前 3080 listener 列表
+  local listeners="$1" pids pid picked holder cname
+  [ -n "$listeners" ] || return 0
+  if [ "$UPGRADE_MODE" -ne 1 ]; then
+    fail "宿主 3080 端口已被占用（实际 listener: $(printf '%s ' "$listeners")；host 网络下 dsh 无法绑定）"
+    return 1
+  fi
+  if [ ! -t 0 ]; then
+    fail "宿主 3080 端口已被占用（实际 listener: $(printf '%s ' "$listeners")）；非交互环境无法选择处理方式，请停止占用者后重跑"
+    return 1
+  fi
+  pids=$(ss -ltnp 2>/dev/null | grep -E ':3080[[:space:]]' | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u)
+  echo
+  echo "  ${C_Y}⚠ 升级检测到 127.0.0.1:3080 已被占用（新 dsh 容器无法绑定）：${C_0}"
+  if [ -n "$pids" ]; then
+    for pid in $pids; do
+      echo "    - $(holder_info_3080 "$pid")"
+    done
+  else
+    echo "    占用者: $(printf '%s ' "$listeners")（无法解析 pid；可能需以 root 运行才能识别）"
+  fi
+  echo "    1) 我手动停止占用者（可先确认占用者身份，停止后重跑本脚本）"
+  echo "    2) 脚本自动停止占用者（容器将 stop+rm，宿主进程将 kill）"
+  printf "  请输入 1 或 2: "
+  read_line picked || return 1
+  case "$picked" in
+    2)
+      for pid in $pids; do
+        holder=$(holder_info_3080 "$pid")
+        case "$holder" in
+          容器*)
+            cname=$(for c in $(docker ps -q 2>/dev/null); do
+                      [ "$(docker inspect -f '{{.State.Pid}}' "$c" 2>/dev/null || true)" = "$pid" ] \
+                        && { docker inspect -f '{{.Name}}' "$c" 2>/dev/null | sed 's#^/##'; break; }
+                    done)
+            [ -n "$cname" ] || cname="未知容器(pid=$pid)"
+            echo "  停止并删除容器 $cname（仅容器，镜像与挂载数据保留）..."
+            docker stop "$cname" >/dev/null 2>&1 || true
+            docker rm -f "$cname" >/dev/null 2>&1 || true
+            ;;
+          *)
+            echo "  终止宿主进程（$holder）..."
+            kill "$pid" 2>/dev/null || true
+            sleep 2
+            kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+            ;;
+        esac
+      done
+      if [ -z "$(listener_addresses 3080 2>/dev/null || true)" ]; then
+        ok "3080 端口已释放，可以继续升级"
+        return 0
+      fi
+      fail "3080 仍被占用（$(printf '%s ' "$(listener_addresses 3080 2>/dev/null || true)")）；请手动停止占用者后重跑"
+      return 1
+      ;;
+    *)
+      fail "3080 已被占用（$(printf '%s ' "$listeners")）；请手动停止占用者后重新运行升级"
+      return 1
+      ;;
+  esac
+}
+
 # 代理监听检测：从 $PROXY 解析目标（本机才检测监听，远程代理只测连通性）；直连模式跳过
 if [ -z "$PROXY" ]; then
   ok "未配置代理（直连模式），跳过代理监听检测"
@@ -2301,7 +2382,9 @@ elif [ -n "$(listener_addresses 3080 2>/dev/null || true)" ]; then
   elif container_running dsh; then
     fail "现有 dsh listener 不符合回环安全预期（实际：$(printf '%s ' "$DSH_CURRENT_LISTENERS")）"
   else
-    fail "宿主 3080 端口已被占用（实际 listener: $(printf '%s ' "$DSH_CURRENT_LISTENERS")；host 网络下 dsh 无法绑定）"
+    # 升级模式下 3080 被非预期占用时让用户选择：手动停止占用者后重跑，
+    # 或由脚本自动停止（容器 stop+rm / 宿主进程 kill）；非升级模式保持直接失败。
+    handle_3080_conflict "$DSH_CURRENT_LISTENERS" || exit 1
   fi
 else
   ok "dsh 端口 3080 空闲"
