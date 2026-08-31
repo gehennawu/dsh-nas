@@ -76,6 +76,28 @@ PUBLIC_PORT=443         # 公网访问 HTTPS 端口（前置反代监听端口�
 pub_url() { # $1=host
   if [ "$PUBLIC_PORT" = "443" ]; then echo "https://$1"; else echo "https://$1:$PUBLIC_PORT"; fi
 }
+
+# ---------- 一次性 token URL 辅助 ----------
+# 从 dsh 容器日志取最新一条 `dsh web:` 行中的 ?token= 段（进程重启后旧 token 失效，必须取最新一行）。
+dsh_web_token() {
+  docker logs dsh 2>/dev/null | grep 'dsh web:' | tail -n 1 | grep -oE '\?token=[^ )]+' | head -n 1 | sed 's/^?token=//'
+}
+# Caddyfile 站点行中的 dsh 域名；剥掉协议与行内端口（反代模式行内是内部端口 $INTERNAL_PORT，不是公网端口）。
+caddyfile_dsh_host() { # $1=Caddyfile
+  grep -oE '^https?://dsh\.[^ {]+' "$1" 2>/dev/null | head -n 1 | sed -E 's#^https?://##; s#:[0-9]+$##'
+}
+# 反代入口模式下从 authelia_url 还原公网 HTTPS 端口；缺失或直连模式按 443 处理。
+caddyfile_public_port() { # $1=Caddyfile
+  local p
+  p=$(grep -oE 'authelia_url=https?://[^[:space:]{}]+' "$1" 2>/dev/null | head -n 1 | sed -n 's#.*:\([0-9][0-9]*\)$#\1#p')
+  [ -n "$p" ] && printf '%s' "$p" || printf '443'
+}
+# 拼接完整公网 token URL（https://host[:端口]/?token=…）；域名或 token 缺失时输出空串。
+web_token_url() { # $1=host $2=port $3=token
+  [ -n "$1" ] && [ -n "$3" ] || return 0
+  if [ "$2" = "443" ] || [ -z "$2" ]; then printf 'https://%s/?token=%s' "$1" "$3"
+  else printf 'https://%s:%s/?token=%s' "$1" "$2" "$3"; fi
+}
 SET_PROXY_ARG=0
 PROFILE_ARGS=""
 
@@ -114,8 +136,8 @@ usage() {
   echo "                      认证用它签发 cookie（默认 30 天）；写入 .env 的 DSH_COOKIE_MAX_AGE_DAYS，"
   echo "                      entrypoint 生成 --patch overlay，无需改镜像"
   echo ""
-  echo "  ./deploy.sh url     打印容器日志中最新一条 dsh web 启动 URL（v0.1.2+ 含一次性 token，"
-  echo "                      浏览器打开即完成/续期会话 cookie；token 属敏感信息）"
+  echo "  ./deploy.sh url     打印最新一条 dsh web 启动 URL 并自动拼接公网地址"
+  echo "                      （https://dsh.example.com[:端口]/?token=…，浏览器打开即完成/续期会话 cookie；token 属敏感信息）"
   echo "  ./deploy.sh update-script"
   echo "                      升级本脚本（git 拉取远端 main，只允许快进；自动保护 Caddyfile/"
   echo "                      Authelia 配置与 Dockerfile 版本选择，不触碰 .env 与 data/）"
@@ -125,7 +147,7 @@ usage() {
   echo "--latest/--alpha 已自动选定对应 dist-tag 不再询问"
 }
 
-# ---------- ./deploy.sh url：打印最新一条 dsh web 启动 URL ----------
+# ---------- ./deploy.sh url：打印最新一条 dsh web 启动 URL（含一次性 token）并拼好公网地址 ----------
 if [ "${1:-}" = "url" ]; then
   if [ $# -ne 1 ]; then echo "错误: url 不接受其它参数"; exit 1; fi
   line=$(docker logs dsh 2>/dev/null | grep 'dsh web:' | tail -n 1)
@@ -134,7 +156,14 @@ if [ "${1:-}" = "url" ]; then
     echo "首次部署请先运行: $0"
     exit 1
   fi
-  echo "$line"
+  url_token=$(printf '%s' "$line" | grep -oE '\?token=[^ )]+' | head -n 1 | sed 's/^?token=//')
+  url_host=$(caddyfile_dsh_host "$CADDYFILE")
+  url_port=$(caddyfile_public_port "$CADDYFILE")
+  if [ -n "$url_token" ] && [ -n "$url_host" ]; then
+    echo "  ${C_B}$(web_token_url "$url_host" "$url_port" "$url_token")${C_0}"
+  else
+    echo "$line"
+  fi
   echo "提示: v0.1.2-alpha.1+ 该 URL 带一次性 token（属敏感信息，勿外传）；"
   echo "      浏览器打开后自动签发/续期会话 cookie（默认 30 天，可用 --cookie-max-age 调整）。"
   exit 0
@@ -2663,16 +2692,23 @@ fi
 section "结果"
 echo "  ${C_B}$PASS 项通过 | $WARN 项警告 | $FAIL 项失败${C_0}"
 if [ "$FAIL" -eq 0 ]; then
-  # 从 Caddyfile 提取实际域名（直连模式行首 https://，反代入口模式行首 http://，统一剥掉前缀）。
-  DSH_DOMAIN=$(grep -oE '^https?://dsh\.[^ {]+' "$CADDYFILE" | head -n 1 | sed -E 's#^https?://##')
-  AUTH_DOMAIN=$(grep -oE '^https?://auth\.[^ {]+' "$CADDYFILE" | head -n 1 | sed -E 's#^https?://##')
+  # 从 Caddyfile 提取实际域名（直连模式行首 https://，反代入口模式行首 http://host:$INTERNAL_PORT，
+  # 统一剥掉协议与行内端口）。
+  DSH_DOMAIN=$(grep -oE '^https?://dsh\.[^ {]+' "$CADDYFILE" | head -n 1 | sed -E 's#^https?://##; s#:[0-9]+$##')
+  AUTH_DOMAIN=$(grep -oE '^https?://auth\.[^ {]+' "$CADDYFILE" | head -n 1 | sed -E 's#^https?://##; s#:[0-9]+$##')
   [ -z "$DSH_DOMAIN" ] && DSH_DOMAIN="dsh.example.com"
   [ -z "$AUTH_DOMAIN" ] && AUTH_DOMAIN="auth.example.com"
   # pub_url：反代入口非 443 端口时自动带 :端口，直连 443 时省略。
   echo "  访问: ${C_B}$(pub_url "$DSH_DOMAIN")${C_0}"
   echo "  首次使用: 打开 $(pub_url "$AUTH_DOMAIN") 登录，按提示注册 TOTP（验证码见 authelia/data/notifications.txt）"
+  # 一次性 token 会话链接：直接从 dsh 容器日志取最新 token，拼好公网地址（进程重启后旧 token 失效）。
+  url_token=$(dsh_web_token)
+  if [ -n "$url_token" ]; then
+    echo "  会话链接（含一次性 token，浏览器打开即完成/续期 cookie）: ${C_B}$(web_token_url "$DSH_DOMAIN" "$PUBLIC_PORT" "$url_token")${C_0}"
+  else
+    echo "  会话链接（含一次性 token）: 容器启动日志尚未打印，稍后运行 $0 url"
+  fi
   echo "  常用: docker compose logs -f dsh | docker compose restart dsh（社区插件增删后同样需要重启）"
-  echo "  dsh Web 启动 URL（新版含一次性 token，浏览器打开即完成/续期会话）: $0 url"
 fi
 if [ "$FAIL" -gt 0 ] || [ "$UP_OK" -ne 1 ]; then
   echo "  ${C_R}部署流程结束，但有检查或启动失败；退出码置为 1，修复后重跑: $0${C_0}"

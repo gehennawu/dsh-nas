@@ -178,7 +178,7 @@ sudo ./deploy.sh --alpha      # 不询问，直接查询 npm alpha 预览版，�
 ./deploy.sh --proxy-host 192.168.1.10:7890  # 设置构建和运行时代理
 ./deploy.sh --setup                          # 重新选择域名、入口或密码
 ./deploy.sh --cookie-max-age 90              # dsh Web 会话 cookie 有效期（天；写入 .env，无需重建镜像）
-./deploy.sh url                              # 打印容器日志中最新一条 dsh web 启动 URL（新版含一次性 token）
+./deploy.sh url                              # 打印最新一条 dsh web 启动 URL，并自动拼好公网地址（https://dsh.example.com[:公网端口]/?token=…）
 sudo ./deploy.sh update-script               # 升级本脚本（git 快进拉取；自动保护本地配置与 Dockerfile 版本）
 ```
 
@@ -188,7 +188,7 @@ dsh v0.1.2-alpha.1 起，Web 界面接入应用层浏览器会话认证（对应
 
 - 每个 dsh 进程生成随机启动令牌；`dsh web` 启动时打印一次带 `?token=…` 的 URL。首次打开该 URL 会签发一个 30 天（可配）签名 cookie 并 303 跳回干净地址；此后所有 Web 会话（含 `/api` RPC）都要求该 cookie，缺失/过期一律 401。Authelia 双因素层不受影响，仍在其前端。
 - **必须的配套改动**：compose 健康检查已改为「任何 HTTP 响应都算存活」（未带 cookie 的 `/` 返回 401 是正常行为，不再导致 unhealthy）。
-- **每月/续期操作**：cookie 密钥持久化在 `data/dsh/.credentials.yaml`，重启/重建不影响已签发 cookie；过期后取令牌有两种方式——SSH 执行 `./deploy.sh url`，或直接看 NAS 官方 Docker 管理界面里 dsh 容器日志的 `dsh web:` 行；复制 `?token=` 段拼成 `https://dsh.example.com/?token=…` 在浏览器打开即可（自动 303 回干净地址，cookie 重新起算）。多个浏览器各自独立持 cookie、独立起算；无痕窗口关闭即失效。
+- **每月/续期操作**：cookie 密钥持久化在 `data/dsh/.credentials.yaml`，重启/重建不影响已签发 cookie；过期后取令牌有两种方式——SSH 执行 `./deploy.sh url`（自动从日志取最新 token 并拼好 `https://dsh.example.com[:公网端口]/?token=…` 公网地址，直接复制打开），或直接看 NAS 官方 Docker 管理界面里 dsh 容器日志的 `dsh web:` 行，复制 `?token=` 段自己拼到公网地址后打开（自动 303 回干净地址，cookie 重新起算）。部署/升级脚本跑完的「结果」摘要里也会直接打印这条会话链接。多个浏览器各自独立持 cookie、独立起算；无痕窗口关闭即失效。
 - **调整有效期**：`./deploy.sh --setup` 向导会询问，或直接 `--cookie-max-age DAYS`；保存在 `.env` 的 `DSH_COOKIE_MAX_AGE_DAYS`，容器 entrypoint 据此生成 `--patch` overlay（覆盖 connection 行 `cookieMaxAgeDays`），**不需要重建镜像**，`docker compose up -d dsh` 重建容器即生效。留空 = dsh 默认 30 天。**改时长只对新签发的 cookie 生效**，已有浏览器需重新打开一次 token URL 才能拿到新时长。
 - **trusted-domain patch 仍保留**：客户端 `connection.isLoopback` 依旧只看页面 hostname，设置页持久化与「在 NAS 上打开文件」等特权面仍依赖 `DSH_TRUSTED_DOMAIN` patch；该 patch 与一次性 token 认证互不冲突（认证在全域生效，patch 只影响浏览器权限面判定）。
 - 若要升级到 alpha 预览版，可使用 `sudo ./deploy.sh --alpha`；该参数读取 npm `alpha` dist-tag，当前不受 `latest` 正式版发布节奏影响。预览版升级仍建议先备份 `data/dsh/` 并完成旧会话、Remote 和 WebSocket 恢复验收。

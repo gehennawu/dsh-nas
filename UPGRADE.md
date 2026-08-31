@@ -93,12 +93,13 @@ npm view dshmarket dist-tags
 3. **首次 401 交换**——升级后第一次访问 `https://dsh.example.com/`（即使 Authelia 已登录）会看到 401。取令牌两种方式任选：
 
 ```sh
-./deploy.sh url                                     # SSH 到 NAS 执行，打印最新启动 URL
+./deploy.sh url                                     # SSH 到 NAS 执行；自动拼好公网地址（https://dsh.example.com[:公网端口]/?token=xxxx），直接复制打开
 # 或：NAS 官方 Docker 管理界面查看 dsh 容器日志，找最新的 "dsh web: ..." 行
 # 输出形如: dsh web: http://127.0.0.1:3080/?token=xxxx (LAN: ...)
+# 手动方式下复制 ?token= 段拼到反代地址：https://dsh.example.com/?token=xxxx
 ```
 
-复制 token 拼到反代地址：`https://dsh.example.com/?token=xxxx` 粘到浏览器打开 → 自动 303 跳回干净地址并签发 cookie → 之后正常使用。**token 与打印出来的 host 无关**，直接取 `?token=` 段即可。
+粘到浏览器打开 → 自动 303 跳回干净地址并签发 cookie → 之后正常使用。**token 与打印出来的 host 无关**，直接取 `?token=` 段即可；`./deploy.sh url` 已自动完成拼接（公网域名/端口从 Caddyfile 读取，反代入口模式的内部端口 13080 不会混入）。
 
 **升级后只需做这一次浏览器交换**：cookie 的 HMAC 密钥持久化在 `data/dsh/.credentials.yaml`（已挂载），重启/重建容器不影响已签发 cookie。
 
@@ -108,7 +109,7 @@ npm view dshmarket dist-tags
 
 | 场景 | 操作 |
 |---|---|
-| cookie 过期 | `./deploy.sh url`，或 NAS 官方 Docker 界面看 dsh 容器日志里的 `dsh web:` 行 → 拼成反代 token URL 打开 → 自动续期，cookie 从当刻重新起算 |
+| cookie 过期 | `./deploy.sh url`（自动拼好公网 token URL，直接复制打开），或 NAS 官方 Docker 界面看 dsh 容器日志里的 `dsh web:` 行手动拼 → 打开 → 自动续期，cookie 从当刻重新起算 |
 | 提前续期 | 同一操作，任何时候都行；令牌在进程生命周期内可反复使用（「一次性」指只接受交换路径，不是单次消费） |
 | dsh 重启/重建后 | **什么都不用做**（cookie 有效则继续用）；如需续期必须用重启后的新 token——旧 token URL 已失效（日志里取最新一行） |
 | 过期 token + 有效 cookie | 无害：会直接 303 回干净地址（只是没有续期效果） |
