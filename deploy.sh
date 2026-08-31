@@ -2040,10 +2040,10 @@ validate_front_proxy_policy() {
     # 的 http:// 站点绑定到 http_port 13080，功能和安全边界不变；同时允许新旧
     # 两种同机写法，避免仅因升级前的配置格式而误判为跨机。
     if [ "$auth_site" -ne 1 ]; then
-      auth_site=$(printf '%s\n' "$active" | grep -cE "^[[:space:]]*http://auth\\.[^[:space:]]+(:$INTERNAL_PORT)?[[:space:]]*\\{" || true)
+      auth_site=$(printf '%s\n' "$active" | grep -cE "^[[:space:]]*http://auth\\.[^[:space:]:]+(:$INTERNAL_PORT)?[[:space:]]*\\{" || true)
     fi
     if [ "$dsh_site" -ne 1 ]; then
-      dsh_site=$(printf '%s\n' "$active" | grep -cE "^[[:space:]]*http://dsh\\.[^[:space:]]+(:$INTERNAL_PORT)?[[:space:]]*\\{" || true)
+      dsh_site=$(printf '%s\n' "$active" | grep -cE "^[[:space:]]*http://dsh\\.[^[:space:]:]+(:$INTERNAL_PORT)?[[:space:]]*\\{" || true)
     fi
     if [ "$auth_site" -ne 1 ] || [ "$dsh_site" -ne 1 ]; then
       fail "同机前置反代必须存在 auth/dsh HTTP 站点；请运行 ./deploy.sh --setup 重新生成配置"
