@@ -2389,6 +2389,19 @@ compose_up() {
     return 0
   fi
   fail "$COMPOSE up -d 失败；运行 $COMPOSE logs 排查（常见: Caddyfile 语法错误 / 端口绑定失败）"
+  # 失败现场自动采集：容器状态/退出码 + 3080 占用方 + dsh 日志尾部，
+  # 避免「dsh 启动即退出」时还需要人工再查一次。
+  echo "  ${C_Y}── compose up 失败现场 ──${C_0}"
+  $COMPOSE $PROFILE_ARGS ps -a 2>&1 | sed 's/^/    /'
+  for name in dsh authelia dsh-caddy; do
+    state=$(docker inspect -f "{{.State.Status}}/exit={{.State.ExitCode}}" "$name" 2>/dev/null || echo "missing")
+    echo "    $name: $state"
+  done
+  if command -v ss >/dev/null 2>&1; then
+    echo "    3080 占用: $(ss -ltnp 2>/dev/null | grep -E '[:.]3080\s' || echo '空闲')"
+  fi
+  echo "    dsh 日志尾部:"
+  docker logs --tail 40 dsh 2>&1 | sed 's/^/      [dsh] /'
   return 1
 }
 compose_down_current() {
@@ -2467,7 +2480,10 @@ else
     DSH_STATE=$(docker inspect -f '{{.State.Status}}' dsh 2>/dev/null || echo "missing")
     if [ "$DSH_STATE" != "running" ]; then
       DSH_EXIT=$(docker inspect -f '{{.State.ExitCode}}' dsh 2>/dev/null || echo '?')
-      fail "dsh 容器状态异常: ${DSH_STATE}（exit=$DSH_EXIT）；请运行 docker logs dsh 查看启动错误"
+      fail "dsh 容器状态异常: ${DSH_STATE}（exit=$DSH_EXIT）"
+      echo "  ${C_Y}    3080 占用: $(ss -ltnp 2>/dev/null | grep -E '[:.]3080\s' || echo '空闲')${C_0}"
+      echo "  ${C_Y}    dsh 日志尾部:${C_0}"
+      docker logs --tail 40 dsh 2>&1 | sed 's/^/      [dsh] /'
       break
     fi
     sleep 3
