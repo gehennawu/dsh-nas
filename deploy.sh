@@ -1970,6 +1970,8 @@ fi
 
 # 入口模式通过向导写入的显式标记恢复；无标记的旧手工配置只做兼容性探测，
 # 探测失败时拒绝继续，避免错误检查 443/13080 和输出错误访问地址。
+# front-proxy 的同机/跨机拓扑由 .env 中的 bind/source 配置恢复；同机默认回环。
+# 旧版本生成的 front-proxy 配置没有模式标记时，由站点地址和默认回环兼容识别。
 MODE_MARKER=$(sed -n 's/^# dsh-nas-entry-mode: //p' "$CADDYFILE" | head -n 1)
 if [ -n "$MODE_MARKER" ]; then
   case "$MODE_MARKER" in
@@ -2033,7 +2035,21 @@ validate_front_proxy_policy() {
   fi
   auth_site=$(printf '%s\n' "$active" | grep -cE "^[[:space:]]*http://auth\\.[^[:space:]]+:$INTERNAL_PORT[[:space:]]*\\{" || true)
   dsh_site=$(printf '%s\n' "$active" | grep -cE "^[[:space:]]*http://dsh\\.[^[:space:]]+:$INTERNAL_PORT[[:space:]]*\\{" || true)
-  if [ "$auth_site" -ne 1 ] || [ "$dsh_site" -ne 1 ]; then
+  if [ "$FRONT_BIND_ADDRESS" = "127.0.0.1" ]; then
+    # 同机模式的旧配置可能省略站点地址中的 :13080：Caddy 会将无端口
+    # 的 http:// 站点绑定到 http_port 13080，功能和安全边界不变；同时允许新旧
+    # 两种同机写法，避免仅因升级前的配置格式而误判为跨机。
+    if [ "$auth_site" -ne 1 ]; then
+      auth_site=$(printf '%s\n' "$active" | grep -cE "^[[:space:]]*http://auth\\.[^[:space:]]+(:$INTERNAL_PORT)?[[:space:]]*\\{" || true)
+    fi
+    if [ "$dsh_site" -ne 1 ]; then
+      dsh_site=$(printf '%s\n' "$active" | grep -cE "^[[:space:]]*http://dsh\\.[^[:space:]]+(:$INTERNAL_PORT)?[[:space:]]*\\{" || true)
+    fi
+    if [ "$auth_site" -ne 1 ] || [ "$dsh_site" -ne 1 ]; then
+      fail "同机前置反代必须存在 auth/dsh HTTP 站点；请运行 ./deploy.sh --setup 重新生成配置"
+      return 1
+    fi
+  elif [ "$auth_site" -ne 1 ] || [ "$dsh_site" -ne 1 ]; then
     fail "跨机前置反代必须为 auth/dsh 站点显式声明内部端口 $INTERNAL_PORT"
     return 1
   fi
