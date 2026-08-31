@@ -153,18 +153,19 @@ chmod +x deploy.sh
 4. 自动生成 Authelia 密钥、用户密码哈希和 Caddyfile（被改写文件备份 `.bak`）；
 5. 询问是否启用 DSH 反代域名 patch；启用时将 hostname 保存到 `.env`，构建阶段以 root patch DSH bundle；不启用则保持原始 loopback-only 行为；
 6. 检查文件、目录、端口、代理连通性；
-7. 构建前交互选择 dsh 版本：展示 Dockerfile 锁定版、npm `latest` 正式版、npm `next` 预览版三个选项（各带版本号），选择后写回 `Dockerfile` 的 `ARG DSH_VERSION`；回车默认保持锁定版，非交互或 registry 不可达时自动按锁定版继续；
+7. 构建前交互选择 dsh 版本：展示 Dockerfile 锁定版、npm `latest` 正式版、npm `next`/`alpha` 预览版四个选项（各带版本号），选择后写回 `Dockerfile` 的 `ARG DSH_VERSION`；回车默认保持锁定版，非交互或 registry 不可达时自动按锁定版继续；
 8. 构建并启动，等待健康检查并校验 listener；全部通过后按 Docker 引用关系清理 dangling 旧镜像。
 
 ## 升级
 
 ```sh
-sudo ./deploy.sh --upgrade    # 交互选择 dsh 版本（锁定版/latest/next）后重建
+sudo ./deploy.sh --upgrade    # 交互选择 dsh 版本（锁定版/latest/next/alpha）后重建
 sudo ./deploy.sh --latest     # 不询问，直接查询 npm latest，更新版本号后重建
+sudo ./deploy.sh --alpha      # 不询问，直接查询 npm alpha 预览版，更新版本号后重建
 ```
 
 - 升级需 root（事务快照与升级锁在 root-only 的 `/var/lib/dsh-nas-upgrade`）。
-- 跳过 Caddy/Authelia 配置向导，但仍交互询问是否启用/更新 DSH 反代域名 patch；构建前还会交互选择 dsh 版本（`--latest` 则跳过选择，直接用 npm latest）；构建前保存配置、`.env`、旧镜像 ID 和容器状态，版本选择发生在快照之后，失败回滚仍恢复旧版本号。
+- 跳过 Caddy/Authelia 配置向导，但仍交互询问是否启用/更新 DSH 反代域名 patch；构建前还会交互选择 dsh 版本（`--latest` 直接取 npm latest，`--alpha` 直接取 npm alpha，二者均跳过选择）；构建前保存配置、`.env`、旧镜像 ID 和容器状态，版本选择发生在快照之后，失败回滚仍恢复旧版本号。
 - `flock` 防并发；版本文件原子替换。
 - 构建、启动、健康或 listener 校验失败时自动恢复旧版本文件、旧镜像和旧 dsh 服务；恢复失败仍非零退出。这是单机回滚保护，不是蓝绿发布。
 - 运行数据在 `data/`，不会因重建丢失。
@@ -189,12 +190,12 @@ dsh v0.1.2-alpha.1 起，Web 界面接入应用层浏览器会话认证（对应
 - **每月/续期操作**：cookie 密钥持久化在 `data/dsh/.credentials.yaml`，重启/重建不影响已签发 cookie；过期后取令牌有两种方式——SSH 执行 `./deploy.sh url`，或直接看 NAS 官方 Docker 管理界面里 dsh 容器日志的 `dsh web:` 行；复制 `?token=` 段拼成 `https://dsh.example.com/?token=…` 在浏览器打开即可（自动 303 回干净地址，cookie 重新起算）。多个浏览器各自独立持 cookie、独立起算；无痕窗口关闭即失效。
 - **调整有效期**：`./deploy.sh --setup` 向导会询问，或直接 `--cookie-max-age DAYS`；保存在 `.env` 的 `DSH_COOKIE_MAX_AGE_DAYS`，容器 entrypoint 据此生成 `--patch` overlay（覆盖 connection 行 `cookieMaxAgeDays`），**不需要重建镜像**，`docker compose up -d dsh` 重建容器即生效。留空 = dsh 默认 30 天。**改时长只对新签发的 cookie 生效**，已有浏览器需重新打开一次 token URL 才能拿到新时长。
 - **trusted-domain patch 仍保留**：客户端 `connection.isLoopback` 依旧只看页面 hostname，设置页持久化与「在 NAS 上打开文件」等特权面仍依赖 `DSH_TRUSTED_DOMAIN` patch；该 patch 与一次性 token 认证互不冲突（认证在全域生效，patch 只影响浏览器权限面判定）。
-- 升级到该版本前请确认：dsh 版本需已在 npm 发布（当前 npm `latest` 仍是 `0.1.1-rc.2`；GitHub release `dsh-v0.1.2-alpha.1` 已存在但未发布到 npm，Dockerfile 的 npm 安装方式暂时选不到）。
+- 若要升级到 alpha 预览版，可使用 `sudo ./deploy.sh --alpha`；该参数读取 npm `alpha` dist-tag，当前不受 `latest` 正式版发布节奏影响。预览版升级仍建议先备份 `data/dsh/` 并完成旧会话、Remote 和 WebSocket 恢复验收。
 
 ## 构建和版本
 
 - dsh 版本唯一来源是 `Dockerfile` 的 `ARG DSH_VERSION`。
-- 交互部署在构建前从 npm dist-tags 端点拉取 `latest`（正式版）与 `next`（预览版）版本号，连同 Dockerfile 锁定版一起列出供选择（直连失败自动走代理重试）；选定后原子写回 `Dockerfile`。`--skip-build` 不构建故不询问，`--latest` 已自动选定 latest 不再询问。
+- 交互部署在构建前从 npm dist-tags 端点拉取 `latest`（正式版）与 `next`/`alpha`（预览版）版本号，连同 Dockerfile 锁定版一起列出供选择（直连失败自动走代理重试）；选定后原子写回 `Dockerfile`。`--skip-build` 不构建故不询问，`--latest`/`--alpha` 已自动选定对应 dist-tag 不再询问。
 - 版本号查询不受缓存影响：脚本不经 npm 本地缓存（纯 HTTP 直读 registry），每次请求追加唯一时间戳参数并携带 `Cache-Control: no-cache` 请求头，穿透转发代理/CDN 等中间层可能按 URL 缓存的旧响应。
 - 代理地址的构建/运行差异：**构建容器有独立网络命名空间，`127.0.0.1` 在构建阶段是构建容器自身、代理不可达**；运行时容器是 host 网络，`127.0.0.1` 与局域网地址都可达。因此单一地址取交集 = NAS 局域网地址（代理需允许局域网访问，如 Clash `allow-lan`）。脚本自动探测出口网卡 IP（`ip route get`，兜底过滤后的 `hostname -I`）作为默认建议值；坚持填 `127.0.0.1` 会警告构建不可达但照常保存（仅适合 `--skip-build` 场景）。
 - 构建阶段的 apt/npm 下载走部署脚本传入的代理；直连模式（`DSH_PROXY=` 空值）下构建不注入代理参数。

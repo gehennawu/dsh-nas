@@ -57,19 +57,21 @@ docker compose up -d dsh          # 重建容器生效，不用重新构建镜�
 
 ## 阶段 1：升级到 v0.1.2+
 
-**前置确认：版本必须已在 npm 发布。** `dsh-v0.1.2-alpha.1` 目前只有 GitHub release，npm `latest` 仍是 `0.1.1-rc.2`（Dockerfile 从 npm 安装，发布前升级引导里选不到）。等到 npm 发布后再执行：
+**alpha 预览版已经发布到 npm 的 `alpha` dist-tag。** 当前不要用 `--latest` 期待得到 alpha 版本：`--latest` 只读取 npm `latest` 正式版。升级前请先备份 `data/dsh/`，并确认目标 alpha 版本的会话/插件兼容性。
 
 ```sh
 # 老用户完整命令（保护配置/自升级在阶段 0；脚本旧则先手动 git pull 一次）
 cd /path/to/dsh-nas && sudo ./deploy.sh update-script
-sudo ./deploy.sh --upgrade                 # 交互选择 dsh 版本后重建
-# 或带设置一次到位：升级 + cookie 有效期 365 天（--upgrade 不会询问有效期）
-sudo ./deploy.sh --upgrade --cookie-max-age 365
-# 或不想交互：
+sudo ./deploy.sh --upgrade                 # 交互选择 dsh 版本（锁定版/latest/next/alpha）后重建
+# 或直接升级到 npm alpha 预览版：
+sudo ./deploy.sh --alpha
+# 或带设置一次到位：alpha 升级 + cookie 有效期 365 天
+sudo ./deploy.sh --alpha --cookie-max-age 365
+# 正式版升级仍使用：
 sudo ./deploy.sh --latest --cookie-max-age 365   # 直接取 npm latest
 ```
 
-升级机制（仓库原有能力）：root-only 事务快照 + 升级锁；构建/启动/健康/listener 校验失败自动恢复旧版本文件、旧镜像和旧 dsh 服务；构建前会再次询问 trusted-domain patch、`--cookie-max-age` 沿用 `.env` 已保存值不重复打扰。
+升级机制（仓库原有能力）：root-only 事务快照 + 升级锁；构建/启动/健康/listener 校验失败自动恢复旧版本文件、旧镜像和旧 dsh 服务；`--latest`/`--alpha` 在快照后查询对应 dist-tag 并写入版本；构建前会再次询问 trusted-domain patch、`--cookie-max-age` 沿用 `.env` 已保存值不重复打扰。
 
 升级当天三件事：
 

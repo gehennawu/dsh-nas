@@ -3,13 +3,14 @@
 # dsh-nas Linux NAS 一键部署脚本
 # 检查：环境 / 文件完整性 / 密钥与域名占位符 / 数据目录权限
 #       / 端口冲突 / 代理连通性；进入构建阶段前交互选择 dsh 版本
-#       （Dockerfile 锁定 / npm latest 正式版 / npm next 预览版，写回 Dockerfile），
+#       （Dockerfile 锁定 / npm latest 正式版 / npm next 预览版 / npm alpha 预览版，写回 Dockerfile），
 #       然后构建并启动、等待健康，最后验证 dsh 仅监听回环；
 #       全部通过后清理 dangling 旧镜像（host 网络下的安全前提）。
 # 用法:
 #   ./deploy.sh                     # 完整检查 + 构建 + 启动
 #   ./deploy.sh --skip-build        # 跳过构建，直接用现有镜像启动
 #   ./deploy.sh --proxy-host 192.168.1.5:7890   # 代理不在本机时指定（构建+运行时，写入 .env）
+#   ./deploy.sh --alpha                     # 升级到 npm alpha 预览版
 # ============================================================
 set -uo pipefail
 
@@ -32,6 +33,7 @@ DSH_COOKIE_MAX_AGE_DAYS=""
 DSH_COOKIE_MAX_AGE_CHANGED=0
 UPGRADE_MODE=0
 LATEST_MODE=0
+ALPHA_MODE=0
 UPGRADE_ROLLBACK_ARMED=0
 UPGRADE_COMMITTED=0
 UPGRADE_SWITCHED=0
@@ -90,7 +92,7 @@ fail() { FAIL=$((FAIL+1)); echo "  ${C_R}✗${C_0} $1"; }
 section() { echo; echo "${C_B}== $1 ==${C_0}"; }
 
 usage() {
-  echo "用法: $0 [--skip-build] [--proxy-host HOST:PORT] [--setup] [--upgrade] [--latest]"
+  echo "用法: $0 [--skip-build] [--proxy-host HOST:PORT] [--setup] [--upgrade] [--latest|--alpha]"
   echo "  --skip-build        跳过镜像构建，直接用现有镜像"
   echo "  --proxy-host ADDR   代理地址（如 192.168.1.5:7890）；构建与运行时都生效，"
   echo "                      写入 .env 的 DSH_PROXY（compose 自动读取）"
@@ -102,7 +104,9 @@ usage() {
   echo "                      向导还会选择是否启用/更新 DSH 反代域名 patch，并保存 DSH_TRUSTED_DOMAIN"
   echo "                      前置反代可选择同机 Lucky 或跨机 Lucky（跨机时限制来源 IP）"
   echo "  --upgrade           升级模式：跳过 Caddy/Authelia 向导，但仍询问是否启用/更新 dsh 域名 patch"
-  echo "  --latest            自动升级到 npm 最新版：查询 @deepseek-ai/dsh latest，更新版本号后"
+  echo "  --latest            自动升级到 npm 最新正式版：查询 @deepseek-ai/dsh latest，更新版本号后"
+  echo "                      构建（隐含 --upgrade；需已完成一次正常部署；仍询问 patch）"
+  echo "  --alpha             自动升级到 npm alpha 预览版：查询 @deepseek-ai/dsh alpha，更新版本号后"
   echo "                      构建（隐含 --upgrade；需已完成一次正常部署；仍询问 patch）"
   echo "  --cookie-max-age DAYS"
   echo "                      dsh Web 浏览器会话 cookie 有效期（正整数天数）。v0.1.2+ 一次性 token"
@@ -116,8 +120,8 @@ usage() {
   echo "                      Authelia 配置与 Dockerfile 版本选择，不触碰 .env 与 data/）"
   echo ""
   echo "交互构建前会询问要安装的 dsh 版本：Dockerfile 锁定版（默认）/ npm latest"
-  echo "正式版 / npm next 预览版，选择后写入 Dockerfile；--skip-build 不构建不询问，"
-  echo "--latest 已自动选定 latest 不再询问"
+  echo "正式版 / npm next 预览版 / npm alpha 预览版，选择后写入 Dockerfile；--skip-build 不构建不询问，"
+  echo "--latest/--alpha 已自动选定对应 dist-tag 不再询问"
 }
 
 # ---------- ./deploy.sh url：打印最新一条 dsh web 启动 URL ----------
@@ -187,6 +191,7 @@ if [ "${1:-}" = "update-script" ]; then
   fi
   echo "脚本已更新: $(git rev-parse --short HEAD)"
   echo "接下来: sudo $0 --upgrade [--cookie-max-age DAYS] 完成部署升级"
+  echo "如需直接跟随 npm alpha 预览通道：sudo $0 --alpha"
   exit 0
 fi
 
@@ -196,6 +201,7 @@ while [ $# -gt 0 ]; do
     --setup) SETUP_FORCE=1 ;;
     --upgrade) UPGRADE_MODE=1 ;;
     --latest) LATEST_MODE=1; UPGRADE_MODE=1 ;;
+    --alpha) ALPHA_MODE=1; UPGRADE_MODE=1 ;;
     --proxy-host)
       [ $# -ge 2 ] || { echo "错误: --proxy-host 需要一个地址（如 192.168.1.5:7890）"; exit 1; }
       PROXY="http://$2"; SET_PROXY_ARG=1; shift ;;
@@ -208,8 +214,13 @@ while [ $# -gt 0 ]; do
   shift
 done
 
+if [ "$LATEST_MODE" -eq 1 ] && [ "$ALPHA_MODE" -eq 1 ]; then
+  echo "错误: --latest 与 --alpha 不能同时使用；请选择一个 npm dist-tag"
+  exit 1
+fi
+
 if [ "$UPGRADE_MODE" -eq 1 ] && [ "$SKIP_BUILD" -eq 1 ]; then
-  echo "错误: --upgrade/--latest 不能与 --skip-build 同时使用；升级必须重新构建 dsh 镜像"
+  echo "错误: --upgrade/--latest/--alpha 不能与 --skip-build 同时使用；升级必须重新构建 dsh 镜像"
   exit 1
 fi
 
@@ -548,7 +559,7 @@ update_dsh_version_atomic() { # $1=validated version
 }
 
 # ---------- 构建前 dsh 版本选择 ----------
-# npm dist-tags：latest = 正式版，next = 预览版（dist-tags 端点一次返回两者，体积远小于完整元数据）。
+# npm dist-tags：latest = 正式版，next/alpha = 预览版（dist-tags 端点一次返回所有 tag，体积远小于完整元数据）。
 npm_dist_tag_version() { # $1=dist-tags JSON $2=tag 名
   printf '%s' "$1" | grep -o "\"$2\": *\"[^\"]*\"" | head -n 1 | cut -d'"' -f4
 }
@@ -601,24 +612,26 @@ npm_fetch_dist_tags() { # stdout: dist-tags JSON（失败输出空）
 }
 
 # 进入构建阶段前交互确认要安装的 dsh 版本：
-#   1) Dockerfile 当前锁定版本（默认）  2) npm latest 正式版  3) npm next 预览版
-# 选 2/3 时把版本号原子写回 Dockerfile 再构建。
-# - --latest 已在前面的升级流程自动写入 latest，这里不再询问（保持无人值守语义）；
+#   1) Dockerfile 当前锁定版本（默认）  2) npm latest 正式版
+#   3) npm next 预览版  4) npm alpha 预览版
+# 选 2/3/4 时把版本号原子写回 Dockerfile 再构建。
+# - --latest/--alpha 已在前面的升级流程自动写入对应 dist-tag，这里不再询问（保持无人值守语义）；
 # - --skip-build 不构建，调用方不触发本函数；
 # - 非 TTY 或 registry 不可达时降级为保持 Dockerfile 锁定版本（只警告，不阻断）；
 # - 升级模式下本函数运行在 backup_upgrade_configs() 之后，选择新版本后若构建/健康失败，
 #   EXIT trap 仍会恢复快照中的旧版本号，回滚语义不变。
 select_dsh_version() {
-  local dockerfile_v latest_v="" next_v="" tags_json="" answer version
+  local dockerfile_v latest_v="" next_v="" alpha_v="" tags_json="" answer version
   dockerfile_v=$(sed -n 's/^ARG DSH_VERSION=//p' "$SCRIPT_DIR/Dockerfile" | head -n 1)
   if ! valid_dsh_version "$dockerfile_v"; then
     fail "无法从 Dockerfile 读取有效的 DSH_VERSION: ${dockerfile_v:-（缺失）}"
     return 1
   fi
   [ "$LATEST_MODE" -eq 1 ] && return 0
+  [ "$ALPHA_MODE" -eq 1 ] && return 0
 
   echo
-  echo "  正在查询 @deepseek-ai/dsh 的 npm 版本号（latest 正式版 / next 预览版；每次强制穿透缓存）..."
+  echo "  正在查询 @deepseek-ai/dsh 的 npm 版本号（latest 正式版 / next、alpha 预览版；每次强制穿透缓存）..."
   tags_json=$(npm_fetch_dist_tags)
   if [ -z "$tags_json" ]; then
     if [ -n "$PROXY" ]; then
@@ -638,12 +651,17 @@ select_dsh_version() {
     next_v=""
     warn "npm dist-tags 未返回有效的 next 预览版"
   fi
-  if [ -z "$latest_v" ] && [ -z "$next_v" ]; then
+  alpha_v=$(npm_dist_tag_version "$tags_json" alpha)
+  if ! valid_dsh_version "$alpha_v"; then
+    alpha_v=""
+    warn "npm dist-tags 未返回有效的 alpha 预览版"
+  fi
+  if [ -z "$latest_v" ] && [ -z "$next_v" ] && [ -z "$alpha_v" ]; then
     warn "npm dist-tags 无可用版本号；本次按 Dockerfile 锁定版本 $dockerfile_v 构建"
     return 0
   fi
   if [ ! -t 0 ]; then
-    echo "  非交互环境：跳过版本选择，按 Dockerfile 锁定版本 $dockerfile_v 构建（npm latest=${latest_v:-不可用} next=${next_v:-不可用}）"
+    echo "  非交互环境：跳过版本选择，按 Dockerfile 锁定版本 $dockerfile_v 构建（npm latest=${latest_v:-不可用} next=${next_v:-不可用} alpha=${alpha_v:-不可用}）"
     return 0
   fi
 
@@ -651,6 +669,7 @@ select_dsh_version() {
   echo "    1) Dockerfile 锁定版本: $dockerfile_v（默认，回车保持）"
   [ -n "$latest_v" ] && echo "    2) npm 正式版 (latest): $latest_v"
   [ -n "$next_v" ] && echo "    3) npm 预览版 (next):   $next_v"
+  [ -n "$alpha_v" ] && echo "    4) npm 预览版 (alpha):  $alpha_v"
   printf "  请选择 [1]: "
   read_line answer || return 1
   [ -z "$answer" ] && answer=1
@@ -662,7 +681,10 @@ select_dsh_version() {
     3)
       [ -n "$next_v" ] || { fail "npm 预览版 (next) 不可用，无法选择 3"; return 1; }
       version="$next_v" ;;
-    *) fail "无效选项: $answer（应为 1、2 或 3）"; return 1 ;;
+    4)
+      [ -n "$alpha_v" ] || { fail "npm 预览版 (alpha) 不可用，无法选择 4"; return 1; }
+      version="$alpha_v" ;;
+    *) fail "无效选项: $answer（应为 1、2、3 或 4）"; return 1 ;;
   esac
 
   if [ "$version" = "$dockerfile_v" ]; then
@@ -1856,14 +1878,17 @@ if [ "$UPGRADE_MODE" -eq 1 ]; then
     fail "无法创建升级前配置快照；为保护版本和 Caddy/Authelia，停止升级"
     exit 1
   }
-  # --latest：从 npm registry 取 @deepseek-ai/dsh 最新版写入版本文件（与网页端升级同一数据源；
-  # 同样经 npm_fetch_dist_tags 穿透缓存，避免拿到过期的 latest）
-  if [ "$LATEST_MODE" -eq 1 ]; then
-    LATEST_JSON=$(npm_fetch_dist_tags)
-    LATEST_V=$(npm_dist_tag_version "$LATEST_JSON" latest)
-    if ! valid_dsh_version "$LATEST_V"; then
-      fail "获取 npm 最新版本失败（registry 直连与代理均不可达，或返回异常）"
-      echo "  可手动改 Dockerfile 的 DSH_VERSION 后，不带 --latest 重跑"
+  # --latest/--alpha：从 npm registry 取对应 dist-tag 写入版本文件（与网页端升级同一数据源；
+  # 同样经 npm_fetch_dist_tags 穿透缓存，避免拿到过期的 dist-tag）
+  if [ "$LATEST_MODE" -eq 1 ] || [ "$ALPHA_MODE" -eq 1 ]; then
+    TARGET_TAG="latest"
+    TARGET_LABEL="npm latest"
+    [ "$ALPHA_MODE" -eq 1 ] && TARGET_TAG="alpha" && TARGET_LABEL="npm alpha"
+    TARGET_JSON=$(npm_fetch_dist_tags)
+    TARGET_V=$(npm_dist_tag_version "$TARGET_JSON" "$TARGET_TAG")
+    if ! valid_dsh_version "$TARGET_V"; then
+      fail "获取 npm $TARGET_TAG 版本失败（registry 直连与代理均不可达，或返回异常）"
+      echo "  可手动改 Dockerfile 的 DSH_VERSION 后，不带 --latest/--alpha 重跑"
       exit 1
     fi
     OLD_V=$(sed -n 's/^ARG DSH_VERSION=//p' "$SCRIPT_DIR/Dockerfile" | head -n 1)
@@ -1871,21 +1896,21 @@ if [ "$UPGRADE_MODE" -eq 1 ]; then
       fail "Dockerfile 中缺少唯一的 DSH_VERSION 版本来源"
       exit 1
     fi
-    if ! update_dsh_version_atomic "$LATEST_V"; then
+    if ! update_dsh_version_atomic "$TARGET_V"; then
       fail "无法原子更新 Dockerfile 的 DSH_VERSION"
       exit 1
     fi
-    if [ "$OLD_V" = "$LATEST_V" ]; then
-      ok "npm 最新版 $LATEST_V 与当前一致（构建走缓存）"
+    if [ "$OLD_V" = "$TARGET_V" ]; then
+      ok "$TARGET_LABEL $TARGET_V 与当前一致（构建走缓存）"
     else
-      ok "dsh 版本已更新: ${OLD_V:-?} → $LATEST_V（npm latest）"
+      ok "dsh 版本已更新: ${OLD_V:-?} → $TARGET_V（$TARGET_LABEL）"
     fi
   fi
 else
   run_setup_wizard || exit 1
 fi
 
-# 首次部署/--setup 与 --upgrade/--latest 都独立询问 patch；升级时必须在
+# 首次部署/--setup 与 --upgrade/--latest/--alpha 都独立询问 patch；升级时必须在
 # backup_upgrade_configs() 之后进行，这样 .env 的最早快照已经就绪，可以安全回滚。
 ACTIVE_CADDY=$(sed '/^[[:space:]]*#/d' "$CADDYFILE")
 CURRENT_DSH_HOST=""
@@ -2359,7 +2384,7 @@ if [ "$SKIP_BUILD" -eq 1 ]; then
     echo "  ${C_R}Compose 启动失败，进入统一失败处理。${C_0}"
   fi
 else
-  # 构建前交互确认 dsh 版本（Dockerfile 锁定 / npm latest 正式版 / npm next 预览版），写回 Dockerfile
+  # 构建前交互确认 dsh 版本（Dockerfile 锁定 / npm latest 正式版 / npm next、alpha 预览版），写回 Dockerfile
   if ! select_dsh_version; then
     echo "${C_R}版本选择失败，中止构建。${C_0}"
     exit 1
