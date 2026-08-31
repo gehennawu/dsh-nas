@@ -58,6 +58,9 @@ fi
 
 # DSH_COOKIE_MAX_AGE_DAYS → 生成 connection 行 overlay（--patch 只在根 profile 层之后追加，
 # 覆盖同名行的 config；必须重述 webRuntime.trustedHosts 表达式，否则该行会回落为空列表）。
+# 注意 argv 顺序：--patch 是 launcher flag，必须位于任何 app 参数（--host 等）之前——
+# launcher 以「第一个未识别 token」为界，之后的参数原样透传给 web app；
+# 把 --patch 放在 --host 之后会被 app 当作自己的参数并报 unknown option '--patch'。
 patch_args=""
 if [ -n "${DSH_COOKIE_MAX_AGE_DAYS:-}" ]; then
   case "$DSH_COOKIE_MAX_AGE_DAYS" in
@@ -80,7 +83,19 @@ if [ -n "${DSH_COOKIE_MAX_AGE_DAYS:-}" ]; then
     echo "dsh-entrypoint: FATAL 无法写入 $patch_file" >&2
     exit 1
   }
-  patch_args="--patch $patch_file"
+  # 老版本 dsh 的 launcher 不认识 --patch（启动时报 unknown option 并退出，
+  # 导致容器 Restarting 崩溃循环）。用零副作用探测确认支持后再追加参数：
+  # `dsh web --dump-config --patch <file>` 只走 dump-config 分支、不 boot 应用、
+  # 不求值 !!js；支持 --patch 的版本正常 exit 0，老版本在 app 参数解析阶段报错非 0。
+  patch_args=""
+  if dsh web --dump-config --patch "$patch_file" >/dev/null 2>&1; then
+    patch_args="--patch $patch_file"
+  else
+    echo "dsh-entrypoint: WARN 当前 dsh 版本不支持 --patch overlay，DSH_COOKIE_MAX_AGE_DAYS 不生效；" >&2
+    echo "dsh-entrypoint: WARN 升级 dsh（如 --alpha）到支持 --patch 的版本后会自动启用。" >&2
+  fi
 fi
 
-exec dsh web --host 127.0.0.1 $trusted_args $patch_args "$@"
+# launcher flag（--patch）必须位于 app 参数（--host/--trusted-host）之前：
+# 第一个未识别 token 之后的参数会原样透传给 web app。
+exec dsh web $patch_args --host 127.0.0.1 $trusted_args "$@"
