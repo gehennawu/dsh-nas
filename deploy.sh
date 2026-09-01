@@ -78,9 +78,10 @@ pub_url() { # $1=host
 }
 
 # ---------- 一次性 token URL 辅助 ----------
-# 从 dsh 容器日志取最新一条 `dsh web:` 行中的 ?token= 段（进程重启后旧 token 失效，必须取最新一行）。
+# 从 dsh 容器日志取最新一条带 `?token=` 的 `dsh web:` 行（token 行之后 dsh 还会打一行
+# "opening the default browser" 提示，必须以 ?token= 过滤掉；进程重启后旧 token 失效，取最新一条）。
 dsh_web_token() {
-  docker logs dsh 2>/dev/null | grep 'dsh web:' | tail -n 1 | grep -oE '\?token=[^ )]+' | head -n 1 | sed 's/^?token=//'
+  docker logs dsh 2>/dev/null | grep 'dsh web:' | grep -E '\?token=' | tail -n 1 | grep -oE '\?token=[^ )]+' | head -n 1 | sed 's/^?token=//'
 }
 # Caddyfile 站点行中的 dsh 域名；剥掉协议与行内端口（反代模式行内是内部端口 $INTERNAL_PORT，不是公网端口）。
 caddyfile_dsh_host() { # $1=Caddyfile
@@ -156,12 +157,13 @@ if [ "${1:-}" = "url" ]; then
     echo "首次部署请先运行: $0"
     exit 1
   fi
-  url_token=$(printf '%s' "$line" | grep -oE '\?token=[^ )]+' | head -n 1 | sed 's/^?token=//')
+  url_token=$(dsh_web_token)
   url_host=$(caddyfile_dsh_host "$CADDYFILE")
   url_port=$(caddyfile_public_port "$CADDYFILE")
   if [ -n "$url_token" ] && [ -n "$url_host" ]; then
     echo "  ${C_B}$(web_token_url "$url_host" "$url_port" "$url_token")${C_0}"
   else
+    # 日志里无 ?token= 行时回退原始输出（仅剩浏览器打开提示行等，无法拼 URL）
     echo "$line"
   fi
   echo "提示: v0.1.2-alpha.1+ 该 URL 带一次性 token（属敏感信息，勿外传）；"
@@ -2706,7 +2708,7 @@ if [ "$FAIL" -eq 0 ]; then
   if [ -n "$url_token" ]; then
     echo "  会话链接（含一次性 token，浏览器打开即完成/续期 cookie）: ${C_B}$(web_token_url "$DSH_DOMAIN" "$PUBLIC_PORT" "$url_token")${C_0}"
   else
-    echo "  会话链接（含一次性 token）: 容器启动日志尚未打印，稍后运行 $0 url"
+    echo "  会话链接（含一次性 token）: 日志中暂无 ?token= 行（容器可能刚启动），稍后运行 $0 url"
   fi
   echo "  常用: docker compose logs -f dsh | docker compose restart dsh（社区插件增删后同样需要重启）"
 fi
