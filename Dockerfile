@@ -83,6 +83,9 @@ COPY entrypoint.sh /usr/local/bin/dsh-entrypoint
 # 明确设为 root 可读、所有用户可执行，确保非 root 的 node 用户能打开入口脚本。
 RUN chmod 0755 /usr/local/bin/dsh-entrypoint
 
+# 仅最终 dsh 镜像参与本项目自动清理；不要给通用基础镜像或中间构建阶段加此标签。
+LABEL io.github.gehennawu.dsh-nas.cleanup="dsh"
+
 USER node
 
 EXPOSE 3080

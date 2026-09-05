@@ -5,7 +5,7 @@
 #       / 端口冲突 / 代理连通性；进入构建阶段前交互选择 dsh 版本
 #       （Dockerfile 锁定 / npm latest 正式版 / npm next 预览版 / npm alpha 预览版，写回 Dockerfile），
 #       然后构建并启动、等待健康，最后验证 dsh 仅监听回环；
-#       全部通过后清理 dangling 旧镜像（host 网络下的安全前提）。
+#       全部通过后仅清理带本项目专用标签的 dangling 旧 dsh 镜像。
 # 用法:
 #   ./deploy.sh                     # 完整检查 + 构建 + 启动
 #   ./deploy.sh --skip-build        # 跳过构建，直接用现有镜像启动
@@ -103,7 +103,7 @@ SET_PROXY_ARG=0
 PROFILE_ARGS=""
 
 # ---------- 输出样式 ----------
-if [ -t 1 ]; then
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != "dumb" ]; then
   C_G=$'\033[32m'; C_Y=$'\033[33m'; C_R=$'\033[31m'; C_B=$'\033[1m'; C_0=$'\033[0m'
 else
   C_G=""; C_Y=""; C_R=""; C_B=""; C_0=""
@@ -112,7 +112,35 @@ PASS=0; FAIL=0; WARN=0
 ok()   { PASS=$((PASS+1)); echo "  ${C_G}✓${C_0} $1"; }
 warn() { WARN=$((WARN+1)); echo "  ${C_Y}⚠${C_0} $1"; }
 fail() { FAIL=$((FAIL+1)); echo "  ${C_R}✗${C_0} $1"; }
-section() { echo; echo "${C_B}== $1 ==${C_0}"; }
+UI_STARTED_AT=$SECONDS
+elapsed_time() {
+  local elapsed=$((SECONDS - UI_STARTED_AT))
+  printf '%s分%02d秒' "$((elapsed / 60))" "$((elapsed % 60))"
+}
+section() {
+  local title="$1"
+  if [[ "$title" =~ ^([1-8])\.\ (.*)$ ]]; then
+    printf '\n%s[%s/8] %s%s\n' "$C_B" "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "$C_0"
+    printf '  累计耗时: %s\n' "$(elapsed_time)"
+  else
+    printf '\n%s== %s ==%s\n' "$C_B" "$title" "$C_0"
+  fi
+}
+health_label() {
+  case "$1" in
+    healthy) printf '已就绪' ;;
+    starting) printf '启动中' ;;
+    unhealthy) printf '检查未通过' ;;
+    missing) printf '状态不可读' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+# 保留普通文本行；首次、状态变化或每约 15 秒更新，避免长等待无反馈或日志刷屏。
+health_progress() { # $1=场景 $2=等待秒数 $3=dsh $4=Authelia $5=Caddy
+  printf '  %s · 已等待 %s秒 / 等待窗口约240秒\n' "$1" "$2"
+  printf '    dsh: %s | Authelia: %s | Caddy: %s\n' \
+    "$(health_label "$3")" "$(health_label "$4")" "$(health_label "$5")"
+}
 
 usage() {
   echo "用法: $0 [--skip-build] [--proxy-host HOST:PORT] [--setup] [--upgrade] [--latest|--alpha]"
@@ -126,7 +154,7 @@ usage() {
   echo "  --setup             强制重跑配置向导（可换域名/入口/密码；原文件备份为 .bak，Authelia 密钥保留）"
   echo "                      向导还会选择是否启用/更新 DSH 反代域名 patch，并保存 DSH_TRUSTED_DOMAIN"
   echo "                      前置反代可选择同机 Lucky 或跨机 Lucky（跨机时限制来源 IP）"
-  echo "  --upgrade           升级模式：跳过 Caddy/Authelia 向导，但仍询问是否启用/更新 dsh 域名 patch；"
+  echo "  --upgrade           升级需 root（sudo）；跳过 Caddy/Authelia 向导，但仍询问是否启用/更新 dsh 域名 patch；"
   echo "                      若 127.0.0.1:3080 被非预期进程/容器占用，会询问手动停止或由脚本自动停止"
   echo "  --latest            自动升级到 npm 最新正式版：查询 @deepseek-ai/dsh latest，更新版本号后"
   echo "                      构建（隐含 --upgrade；需已完成一次正常部署；仍询问 patch）"
@@ -142,6 +170,8 @@ usage() {
   echo "  ./deploy.sh update-script"
   echo "                      升级本脚本（git 拉取远端 main，只允许快进；自动保护 Caddyfile/"
   echo "                      Authelia 配置与 Dockerfile 版本选择，不触碰 .env 与 data/）"
+  echo "                      注意：更新前会自动丢弃未受保护的已跟踪文件的未暂存修改，不询问、不自动备份；"
+  echo "                      后续合并失败也不会恢复已丢弃的修改。手工改过脚本/包文件时，请先自行备份。"
   echo ""
   echo "交互构建前会询问要安装的 dsh 版本：Dockerfile 锁定版（默认）/ npm latest"
   echo "正式版 / npm next 预览版 / npm alpha 预览版，选择后写入 Dockerfile；--skip-build 不构建不询问，"
@@ -206,13 +236,18 @@ if [ "${1:-}" = "update-script" ]; then
   # 受保护配置（Caddyfile/Authelia）已 skip-worktree，git checkout 不会触碰；
   # .env 与 data/ 未被跟踪，天然安全。先列出将被回滚的改动再执行。
   if [ -n "$(git status --porcelain)" ]; then
-    echo "以下包文件有本地改动，将按远端更新（受保护配置与 .env/data 不受影响）:"
+    echo "${C_Y}注意：以下为当前 Git 状态；未受保护的已跟踪文件的未暂存修改将被自动丢弃。${C_0}"
+    echo "  不会询问确认，也不会自动备份；后续合并失败也不会恢复已丢弃的修改。"
+    echo "  未跟踪文件不会被此 checkout 删除；已暂存修改可能使后续合并失败。"
+    echo "  Caddyfile/Authelia 沿用现有 skip-worktree 保护（不等于备份）；.env/data 沿用未跟踪约定。"
+    echo "  Dockerfile 版本选择仅在合并成功后尝试写回；其它 Dockerfile 未暂存修改不保留。"
     git status --porcelain | sed 's/^/  /'
     git checkout -- . 2>/dev/null || true
   fi
   if ! git merge --ff-only FETCH_HEAD >/dev/null 2>&1; then
-    echo "错误: 本地 main 与远端分叉（本地有未推送提交？），无法快进合并。请手动处理:"
-    echo "  cd $SCRIPT_DIR && git pull --rebase"
+    echo "错误: 快进合并失败（可能是分支分叉、本地改动冲突或配置保护冲突）。请先检查 git status。"
+    echo "注意：若前面执行过 checkout，已丢弃的未暂存修改不会自动恢复，Dockerfile 版本也尚未写回。"
+    echo "  确认原因并备份后，再决定是否手动执行: cd $SCRIPT_DIR && git pull --rebase"
     exit 1
   fi
 
@@ -856,7 +891,8 @@ restore_upgrade_version() {
     fi
     UPGRADE_ENV_ROLLBACK_ARMED=0
   fi
-  return "$restore_ok"
+  # restore_ok 是布尔标记（1 = 全部成功），Shell 退出码则以 0 表示成功。
+  [ "$restore_ok" -eq 1 ]
 }
 restore_upgrade_image() {
   [ -n "$UPGRADE_OLD_IMAGE_ID" ] || return 1
@@ -885,27 +921,39 @@ wait_for_stack_healthy() {
   return 1
 }
 
-# Docker 的 dangling 镜像是没有标签且没有容器引用的镜像。
-# `image prune` 由 Docker 根据引用关系决定可删除对象；这里只清理 dangling，
-# 不使用 -a，避免误删仍有标签但暂时未运行的镜像。
-# 清理失败只产生警告，不影响已经通过健康检查的部署结果。
+# 专用 label 仅由本项目 Dockerfile 的最终 dsh 阶段写入。
+# 不使用 -a：只清理匹配标签的 dangling 镜像，由 Docker 排除所有容器引用。
+# 历史未标记镜像、其它项目及 Caddy/Authelia 镜像保留；不做全局清理。
+# 标签是清理归属约定，不是安全认证；其它构建不要复用此标签。
 cleanup_dangling_images() {
   local before after removed
-  before=$(docker image ls --filter dangling=true --quiet 2>/dev/null \
+  local project_filter='label=io.github.gehennawu.dsh-nas.cleanup=dsh'
+  echo "  镜像清理：仅本项目已标记的悬空 dsh 镜像；未标记历史镜像及其它项目镜像保留。"
+  before=$(docker image ls --filter dangling=true --filter "$project_filter" --quiet 2>/dev/null \
     | sort -u \
-    | awk 'NF { count++ } END { print count + 0 }')
-
-  if ! docker image prune --force >/dev/null 2>&1; then
-    warn "悬空镜像清理失败，已跳过（不影响已通过健康检查的服务）"
+    | awk 'NF { count++ } END { print count + 0 }') || {
+      warn "无法列出本项目镜像，已跳过清理（不影响已通过健康检查的服务）"
+      return 0
+    }
+  if [ "$before" -eq 0 ]; then
+    ok "本项目没有待清理的已标记悬空镜像"
     return 0
   fi
 
-  after=$(docker image ls --filter dangling=true --quiet 2>/dev/null \
+  if ! docker image prune --force --filter "$project_filter" >/dev/null 2>&1; then
+    warn "本项目悬空镜像清理失败，已跳过（不影响已通过健康检查的服务）"
+    return 0
+  fi
+
+  after=$(docker image ls --filter dangling=true --filter "$project_filter" --quiet 2>/dev/null \
     | sort -u \
-    | awk 'NF { count++ } END { print count + 0 }')
+    | awk 'NF { count++ } END { print count + 0 }') || {
+      warn "本项目镜像清理已执行，但无法读取清理后数量"
+      return 0
+    }
   removed=$((before - after))
   [ "$removed" -lt 0 ] && removed=0
-  ok "悬空镜像（dangling）清理完成：移除 $removed 个无引用镜像"
+  ok "本项目悬空镜像清理完成：数量减少 $removed 个（前后快照统计；容器引用镜像保留）"
 }
 
 # ---------- 构建产物核验（patch 可见性） ----------
@@ -1292,11 +1340,12 @@ listener_addresses() { # $1=port
 caddy_listeners() {
   local config
   config=$(docker exec dsh-caddy wget -qO- http://127.0.0.1:2019/config/ 2>/dev/null) || return 1
+  # 仅去除引号、水平空白和 CR；必须保留 LF，避免多个监听地址被拼成一行。
   printf '%s' "$config" \
     | grep -oE '"listen"[[:space:]]*:[[:space:]]*\[[^]]*\]' \
     | sed -E 's/.*\[(.*)\].*/\1/' \
     | tr ',' '\n' \
-    | tr -d '"[:space:]'
+    | tr -d '"[:blank:]\r'
 }
 
 listener_tool_available() {
@@ -1660,6 +1709,14 @@ EOF
 }
 
 # ============================================================
+printf '\n%sDSH NAS · 部署助手%s\n' "$C_B" "$C_0"
+if [ "$UPGRADE_MODE" -eq 1 ]; then
+  echo "  本次操作: 升级现有服务（失败时尝试回滚）"
+elif [ "$SKIP_BUILD" -eq 1 ]; then
+  echo "  本次操作: 使用现有镜像检查并启动"
+else
+  echo "  本次操作: 检查配置、构建并启动"
+fi
 section "1. 环境检查"
 # ---------- docker / compose ----------
 COMPOSE=""
@@ -2563,7 +2620,7 @@ else
     echo "  1) apt 阶段失败：apt 与 npm 一样走构建代理（默认 Debian 源）——检查代理是否可达（地址正确、Clash 开了 allow-lan）；"
     echo "     可换可用代理重跑: $0 --proxy-host <宿主IP>:7890"
     echo "  2) npm 阶段失败：构建容器内的 127.0.0.1 是容器自身，不是宿主——"
-    echo "     必须用宿主可达地址重跑：${C_B}./deploy.sh --proxy-host 192.168.1.10${C_0}（换成 NAS 局域网 IP）"
+    echo "     必须用宿主可达地址重跑：${C_B}./deploy.sh --proxy-host 192.168.1.10:7890${C_0}（换成 NAS 局域网 IP）"
     echo "     并确认 Clash 允许局域网访问（allow-lan: true，监听 0.0.0.0:7890）。"
     echo "  修复后重跑本脚本即可。"
     exit 1
@@ -2583,6 +2640,9 @@ else
   CADDY_STATUS="starting"
   DSH_STATE=""
   DSH_EXIT=""
+  HEALTH_WAIT_STARTED=$SECONDS
+  HEALTH_LAST_REPORT=$SECONDS
+  HEALTH_LAST_STATE=""
   # healthcheck 参数（interval 30s / start_period dsh 30s、authelia 60s）叠加后，
   # 三者最坏可在 200s 左右才全部 healthy；120s 窗口会误杀正常启动，这里放宽到 240s。
   for i in $(seq 1 80); do
@@ -2590,6 +2650,12 @@ else
     AUTHELIA_STATUS=$(docker inspect -f '{{.State.Health.Status}}' authelia 2>/dev/null || echo "starting")
     CADDY_STATUS=$(docker inspect -f '{{.State.Health.Status}}' dsh-caddy 2>/dev/null || echo "starting")
     [ "$STATUS" = "healthy" ] && [ "$AUTHELIA_STATUS" = "healthy" ] && [ "$CADDY_STATUS" = "healthy" ] && break
+    HEALTH_CURRENT_STATE="$STATUS/$AUTHELIA_STATUS/$CADDY_STATUS"
+    if [ "$HEALTH_CURRENT_STATE" != "$HEALTH_LAST_STATE" ] || [ "$((SECONDS - HEALTH_LAST_REPORT))" -ge 15 ]; then
+      health_progress "等待服务就绪" "$((SECONDS - HEALTH_WAIT_STARTED))" "$STATUS" "$AUTHELIA_STATUS" "$CADDY_STATUS"
+      HEALTH_LAST_STATE="$HEALTH_CURRENT_STATE"
+      HEALTH_LAST_REPORT=$SECONDS
+    fi
     # 容器已退出（error/exited）时立即失败并给出退出码，不要白等；日志是根因证据
     DSH_STATE=$(docker inspect -f '{{.State.Status}}' dsh 2>/dev/null || echo "missing")
     if [ "$DSH_STATE" != "running" ]; then
@@ -2692,7 +2758,16 @@ fi
 
 # ---------- 总结 ----------
 section "结果"
+if [ "$FAIL" -eq 0 ] && [ "$UP_OK" -eq 1 ]; then
+  echo "  ${C_G}${C_B}部署完成${C_0}"
+else
+  echo "  ${C_R}${C_B}部署未完成，请先处理下方失败提示${C_0}"
+fi
 echo "  ${C_B}$PASS 项通过 | $WARN 项警告 | $FAIL 项失败${C_0}"
+echo "  总耗时: $(elapsed_time)"
+if [ "$WARN" -gt 0 ]; then
+  echo "  有 $WARN 项提醒，请检查上方 ⚠ 内容。"
+fi
 if [ "$FAIL" -eq 0 ]; then
   # 从 Caddyfile 提取实际域名（直连模式行首 https://，反代入口模式行首 http://host:$INTERNAL_PORT，
   # 统一剥掉协议与行内端口）。
@@ -2710,7 +2785,8 @@ if [ "$FAIL" -eq 0 ]; then
   else
     echo "  会话链接（含一次性 token）: 日志中暂无 ?token= 行（容器可能刚启动），稍后运行 $0 url"
   fi
-  echo "  常用: docker compose logs -f dsh | docker compose restart dsh（社区插件增删后同样需要重启）"
+  echo "  查看日志: docker compose logs -f dsh"
+  echo "  重启服务: docker compose restart dsh（社区插件增删后同样需要重启）"
 fi
 if [ "$FAIL" -gt 0 ] || [ "$UP_OK" -ne 1 ]; then
   echo "  ${C_R}部署流程结束，但有检查或启动失败；退出码置为 1，修复后重跑: $0${C_0}"

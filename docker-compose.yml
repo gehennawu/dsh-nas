@@ -10,7 +10,7 @@
 #   1. 把本目录放到 NAS 上（SSH 或共享文件夹）
 #   2. 按 README 改 Caddyfile 和 authelia/*.yml 里的域名/密钥/密码
 #   3. mkdir -p data/dsh data/workspace caddy/data caddy/config
-#   4. sudo chown -R 1000:1000 data
+#   4. sudo chown -R 1000:1000 data/dsh data/workspace（不要修改整个 data 的属主）
 #   5. docker compose --profile auth up -d --build（主方案启动 Authelia）
 #   6. 浏览器访问配置向导输出的 HTTPS 地址
 
