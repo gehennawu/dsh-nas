@@ -6,3 +6,11 @@ caddy/config/
 notifications.txt
 authelia/data/
 *.sqlite3
+
+# Local agent planning documents（本机知识库，不进版本库）
+KNOWLEDGE.md
+AGENTS.md
+
+# Python（dsh-nas 的 tests 会生成）
+__pycache__/
+*.pyc
