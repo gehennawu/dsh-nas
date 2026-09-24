@@ -177,6 +177,7 @@ docker compose restart dsh
 - 升级前自动快照配置、`.env`、旧版本文件、旧镜像与容器状态。构建、启动、健康检查或 listener 校验任一失败，均恢复旧版本文件与旧镜像 tag。升级前三个容器中任一处于运行状态时，同时停止失败的新栈并重新启动旧栈；恢复失败以非零码退出。该机制为**单机回滚保护**，不具备零停机能力。
 - 持久化数据不限于 `data/`：dsh 配置与会话在 `data/dsh/`，工作区在 `data/workspace/`，Authelia 的 SQLite 与通知在 `authelia/data/`，证书与 Caddy 状态在 `caddy/data/`、`caddy/config/`。重建容器不影响上述目录，备份时须全部覆盖。
 - `sudo ./deploy.sh --latest` / `--alpha` 分别跟随 npm 正式版与 alpha 预览版，alpha dist-tag 不受 `latest` 发布节奏影响。升级 alpha 前备份 `data/dsh/`，升级后验证旧会话、Remote 与 WebSocket。
+- 从 Node 22 升到 Node 24：先备份 `data/dsh/`，在 NAS 项目目录执行 `sudo ./deploy.sh update-script` 获取新版 Dockerfile，再运行 `sudo ./deploy.sh --upgrade`，版本选择时选 1（回车保持已锁定的 DSH 版本），不要加 `--skip-build`。脚本会重新构建并切换容器；`docker compose restart dsh` 不会更换 Node。完成后运行 `docker exec dsh node -p 'process.version + " / undici " + process.versions.undici'` 确认显示 v24.x，再实际验证「获取可用模型」。Node 24 对此模型发现报错尚未经过容器实测，不能视为已修复；必要时继续使用渠道 `accept-encoding: identity` 绕过。`node:24-bookworm` 只固定大版本，构建时实际小版本由基础镜像决定。
 
 ## 故障排查
 
