@@ -40,7 +40,7 @@ class DeployCliTests(unittest.TestCase):
         fake = self.bin / 'fake-system.py'
         shutil.copyfile(REPO / 'tests/fake-system.py', fake)
         fake.chmod(0o755)
-        for tool in ('docker', 'curl', 'wget', 'ip', 'id', 'stat', 'cp', 'chown',
+        for tool in ('docker', 'curl', 'wget', 'ip', 'id', 'stat', 'cp', 'chown', 'timeout',
                      'sync', 'sleep', 'ss', 'netstat', 'sudo', 'systemctl',
                      'service', 'apt-get', 'usermod', 'setpriv', 'git'):
             (self.bin / tool).symlink_to(fake)
@@ -213,6 +213,55 @@ class DeployCliTests(unittest.TestCase):
         result = self.run_deploy('--skip-build')
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertEqual(json.loads(inventory.read_text()), images)
+
+    def run_deploy_with_tty(self, answers, *args):
+        try:
+            master, slave = pty.openpty()
+        except OSError as error:
+            self.skipTest(f'PTY unavailable in this environment: {error}')
+        try:
+            process = subprocess.Popen([str(self.bin / 'bash'), str(self.project / 'deploy.sh'), *args],
+                                       cwd=self.project, env=self.env, stdin=slave,
+                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            os.write(master, answers.encode())
+            output, _ = process.communicate(timeout=30)
+            unexpected = self.root / 'unexpected-commands'
+            self.assertFalse(unexpected.exists(), unexpected.read_text() if unexpected.exists() else '')
+            return subprocess.CompletedProcess(process.args, process.returncode, output)
+        finally:
+            os.close(master)
+            os.close(slave)
+
+    def test_official_base_image_pull_then_build_uses_official_image(self):
+        self.env['TEST_PULL_RESULT'] = 'success'
+        result = self.run_deploy()
+        self.assertEqual(result.returncode, 0, result.stdout)
+        calls = (self.root / 'base-image-calls').read_text()
+        self.assertIn('pull node:26-bookworm', calls)
+        self.assertIn('NODE_BASE_IMAGE=node:26-bookworm', calls)
+
+    def test_invalid_pull_timeout_fails_before_pull(self):
+        self.env['DSH_BASE_PULL_TIMEOUT'] = 'unsafe'
+        result = self.run_deploy()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('DSH_BASE_PULL_TIMEOUT', result.stdout)
+        self.assertFalse((self.root / 'base-image-calls').exists())
+
+    def test_timed_out_pull_in_noninteractive_mode_aborts_before_build(self):
+        self.env['TEST_PULL_RESULT'] = 'timeout'
+        result = self.run_deploy()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('需要交互终端', result.stdout)
+        self.assertNotIn('NODE_BASE_IMAGE=', (self.root / 'base-image-calls').read_text())
+
+    def test_mirror_selection_passes_image_to_both_build_stages(self):
+        self.env['TEST_PULL_RESULT'] = 'timeout'
+        result = self.run_deploy_with_tty('1\n2\n1\n')
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn('NODE_BASE_IMAGE=mirror.gcr.io/library/node:26-bookworm',
+                      (self.root / 'base-image-calls').read_text())
+        self.assertIn('ARG NODE_BASE_IMAGE=node:26-bookworm', (self.project / 'Dockerfile').read_text())
+        self.assertEqual((self.project / 'Dockerfile').read_text().count('FROM ${NODE_BASE_IMAGE}'), 2)
 
     def test_final_dsh_image_declares_cleanup_ownership(self):
         final_stage = (self.project / 'Dockerfile').read_text().rsplit('FROM ', 1)[1]

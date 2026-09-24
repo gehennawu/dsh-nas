@@ -178,6 +178,7 @@ docker compose restart dsh
 - 持久化数据不限于 `data/`：dsh 配置与会话在 `data/dsh/`，工作区在 `data/workspace/`，Authelia 的 SQLite 与通知在 `authelia/data/`，证书与 Caddy 状态在 `caddy/data/`、`caddy/config/`。重建容器不影响上述目录，备份时须全部覆盖。
 - `sudo ./deploy.sh --latest` / `--alpha` 分别跟随 npm 正式版与 alpha 预览版，alpha dist-tag 不受 `latest` 发布节奏影响。升级 alpha 前备份 `data/dsh/`，升级后验证旧会话、Remote 与 WebSocket。
 - 从 Node 22/24 升到 Node 26：先备份 `data/dsh/`，在 NAS 项目目录执行 `sudo ./deploy.sh update-script` 获取新版 Dockerfile，再运行 `sudo ./deploy.sh --upgrade`，版本选择时选 1（回车保持已锁定的 DSH 版本），不要加 `--skip-build`。脚本会重新构建并切换容器；`docker compose restart dsh` 不会更换 Node。完成后运行 `docker exec dsh node -p 'process.version + " / undici " + process.versions.undici'` 确认显示 v26.x，再验证「获取可用模型」。用户反馈 Node 24 下模型列表仍报错、改用 Node 26 后恢复；这是用户环境中的验收结果，发布环境无 Docker，未独立复测。其他环境若仍报错，可暂用渠道 `accept-encoding: identity` 绕过。`node:26-bookworm` 只固定大版本，构建时实际小版本由基础镜像决定。
+- 构建前会单独 `docker pull node:26-bookworm` 并显示下载进度，默认最多等待 180 秒；可临时设置 `sudo env DSH_BASE_PULL_TIMEOUT=600 ./deploy.sh --upgrade`（允许 30–3600 秒）。失败或超时后可继续尝试官方源、切换 `mirror.gcr.io`、手填可信的 HTTPS 镜像站域名，或退出。选择只影响本次构建的两个基础镜像阶段，不修改 Docker daemon、`.env` 或其它项目；非交互环境拉取失败时直接退出。镜像站缓存不保证存在或实时同步，第三方来源需要自行信任；daemon 是否仍在下载需另查。超时不限制 apt/npm 或原生编译，也不能让普通 `docker pull` 自动走构建代理。
 
 ## 故障排查
 

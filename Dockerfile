@@ -14,8 +14,11 @@
 #    /workspace     — 交互主目录 + 启动工作目录（Web 目录选择器的新建
 #                      操作落在该可写目录，挂载持久化）
 
+# 两个阶段共用同一基础镜像。仅构建时覆盖，不修改 Docker daemon 或其他项目。
+ARG NODE_BASE_IMAGE=node:26-bookworm
+
 # ---------- 构建阶段：装编译工具链 + 安装 dsh ----------
-FROM node:26-bookworm AS build
+FROM ${NODE_BASE_IMAGE} AS build
 
 ARG DSH_VERSION=0.1.0-rc.8
 
@@ -30,7 +33,7 @@ RUN apt-get update \
  && npm install -g @deepseek-ai/dsh@${DSH_VERSION}
 
 # ---------- 运行阶段：干净的运行时镜像 ----------
-FROM node:26-bookworm
+FROM ${NODE_BASE_IMAGE}
 
 # node:26-bookworm 为完整版镜像；当前网页升级不直接驱动宿主 Docker，
 # 因此运行镜像不再内置 Docker CLI/Compose，也不挂载 docker.sock。

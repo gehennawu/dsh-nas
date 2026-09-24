@@ -23,6 +23,17 @@ def output(text=''):
     sys.exit(0)
 
 
+if name == 'timeout':
+    # Deterministic timeout without waiting; the real CLI uses GNU timeout.
+    command = args[4:] if args[:3] == ['--signal=INT', '--kill-after=5s', '--foreground'] else None
+    if command is None or len(command) != 3 or Path(command[0]).name != 'docker' or command[1] != 'pull':
+        unexpected()
+    if command[2] == 'node:26-bookworm' and os.environ.get('TEST_PULL_RESULT') == 'timeout':
+        with (root / 'base-image-calls').open('a') as log:
+            log.write('pull node:26-bookworm (timeout)\n')
+        sys.exit(124)
+    sys.exit(subprocess.run(command).returncode)
+
 if name == 'curl':
     if any('registry.npmjs.org/' in arg for arg in args):
         output('{"latest":"0.1.2","next":"0.1.2","alpha":"0.1.2-alpha.1"}')
@@ -73,6 +84,22 @@ if name == 'ss' and args == ['-ltn']:
 if name != 'docker':
     unexpected()
 
+if args[:1] == ['pull'] and len(args) == 2:
+    with (root / 'base-image-calls').open('a') as log:
+        log.write('pull ' + args[1] + '\n')
+    return_code = 1 if args[1] == 'node:26-bookworm' and os.environ.get('TEST_PULL_RESULT') == 'failure' else 0
+    sys.exit(return_code)
+if args[:2] == ['compose', 'build']:
+    build_args = args[2:]
+    if '--build-arg' not in build_args:
+        unexpected()
+    node_base = next((build_args[i + 1] for i, arg in enumerate(build_args[:-1])
+                      if arg == '--build-arg' and build_args[i + 1].startswith('NODE_BASE_IMAGE=')), None)
+    if node_base is None:
+        unexpected()
+    with (root / 'base-image-calls').open('a') as log:
+        log.write(node_base + '\n')
+    sys.exit(0)
 if args == ['info']:
     sys.exit(0)
 if args == ['version', '--format', '{{.Server.Version}}']:

@@ -2608,6 +2608,63 @@ else
     echo "  构建镜像（首次约 10 分钟，native 依赖编译；npm 直连；DSH patch=${DSH_TRUSTED_DOMAIN:-关闭}）..."
   fi
   echo "  （patch 在构建 RUN 步骤内执行，BuildKit 进度 UI 会折叠其输出；构建完成后脚本会进入镜像实测 patch 与版本）"
+  # 只限基础镜像预拉取，不限制耗时较长的 apt/npm/native 编译。镜像站选择仅作用于本次构建。
+  # Docker daemon 拉取发生在 build 之前；不能用 --build-arg HTTP_PROXY 代理这个阶段。
+  NODE_BASE_IMAGE=node:26-bookworm
+  BASE_PULL_TIMEOUT="${DSH_BASE_PULL_TIMEOUT:-180}"
+  if [[ ! "$BASE_PULL_TIMEOUT" =~ ^[0-9]+$ ]] || [ "$BASE_PULL_TIMEOUT" -lt 30 ] || [ "$BASE_PULL_TIMEOUT" -gt 3600 ]; then
+    fail "DSH_BASE_PULL_TIMEOUT 应为 30–3600 秒的整数"
+    exit 1
+  fi
+  if ! command -v timeout >/dev/null 2>&1; then
+    fail "缺少 GNU timeout，无法为基础镜像拉取设置等待上限"
+    exit 1
+  fi
+  while :; do
+    echo "  拉取基础镜像 $NODE_BASE_IMAGE（本次最多等待 ${BASE_PULL_TIMEOUT}s；显示下载进度）..."
+    timeout --signal=INT --kill-after=5s --foreground "${BASE_PULL_TIMEOUT}s" docker pull "$NODE_BASE_IMAGE"
+    pull_rc=$?
+    [ "$pull_rc" -eq 0 ] && break
+    if [ "$pull_rc" -eq 124 ] || [ "$pull_rc" -eq 137 ]; then
+      warn "拉取超过 ${BASE_PULL_TIMEOUT}s；这是本次等待上限，不代表官方源永久不可用。"
+    else
+      warn "基础镜像拉取失败（退出码 $pull_rc）。"
+    fi
+    echo "  拉取命令已结束；daemon 端是否仍在下载不能仅凭超时码断定，可另查 docker image inspect / docker events。"
+    if [ ! -t 0 ]; then
+      fail "基础镜像拉取未完成且需要交互终端选择镜像源；请在终端重跑"
+      exit 1
+    fi
+    echo "    1) 继续尝试官方源（重置本次等待上限）"
+    echo "    2) 改用镜像站（来源与缓存由第三方管理）"
+    echo "    3) 退出（保留旧容器；升级模式进入回滚）"
+    printf "  请选择 [1/2/3]: "
+    read_line pull_choice || exit 1
+    case "$pull_choice" in
+      1) NODE_BASE_IMAGE=node:26-bookworm ;;
+      2)
+        echo "    1) mirror.gcr.io（已核对 node:26-bookworm 清单，缓存可能过期或缺失）"
+        echo "    2) 手填可信的 HTTPS 镜像站域名（不含协议/路径/凭据）"
+        printf "  请选择 [1/2]: "
+        read_line mirror_choice || exit 1
+        case "$mirror_choice" in
+          1) mirror_host=mirror.gcr.io ;;
+          2)
+            printf "  镜像站域名: "
+            read_line mirror_host || exit 1
+            if [[ ! "$mirror_host" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ ]] || [[ "$mirror_host" != *.* ]] || [[ "$mirror_host" == *..* ]]; then
+              warn "镜像站域名无效；仅接受无协议、端口、路径和凭据的 DNS 域名"
+              continue
+            fi ;;
+          *) warn "无效选择，继续提示"; continue ;;
+        esac
+        NODE_BASE_IMAGE="$mirror_host/library/node:26-bookworm"
+        warn "将从 $mirror_host 获取基础镜像；请仅选择信任的镜像站，不能保证其内容与官方实时一致。" ;;
+      3) fail "用户选择退出构建"; exit 1 ;;
+      *) warn "无效选择，继续提示" ;;
+    esac
+  done
+  BUILD_ARGS+=(--build-arg "NODE_BASE_IMAGE=$NODE_BASE_IMAGE")
   if $COMPOSE build "${BUILD_ARGS[@]}"; then
     ok "构建完成"
     if ! verify_dsh_image "构建后"; then
