@@ -3,10 +3,10 @@
 # DeepSeek Harness (dsh) — Linux NAS Docker 镜像模板
 #
 # 约束与设计：
-# 1. 基础镜像必须用完整版 node:24-bookworm（不能用 slim）——
+# 1. 基础镜像必须用完整版 node:26-bookworm（不能用 slim）——
 #    DSH 的 native 依赖（landlock-run 等）npm 安装时要走 node-gyp 编译。
 # 2. 官方没有发布 Docker 镜像，这里用官方 npm 包安装，版本用 ARG 锁定。
-# 3. 运行身份：node:24 官方镜像自带的 node 用户（UID 1000，非 root）；
+# 3. 运行身份：node:26 官方镜像自带的 node 用户（UID 1000，非 root）；
 #    tini 作为 PID 1，负责信号转发（docker stop → SIGTERM → dsh）
 #    与子进程收割（Agent 启动的 bash/后台任务不残留僵尸进程）。
 # 4. 数据与工作区分离：
@@ -15,7 +15,7 @@
 #                      操作落在该可写目录，挂载持久化）
 
 # ---------- 构建阶段：装编译工具链 + 安装 dsh ----------
-FROM node:24-bookworm AS build
+FROM node:26-bookworm AS build
 
 ARG DSH_VERSION=0.1.0-rc.8
 
@@ -30,9 +30,9 @@ RUN apt-get update \
  && npm install -g @deepseek-ai/dsh@${DSH_VERSION}
 
 # ---------- 运行阶段：干净的运行时镜像 ----------
-FROM node:24-bookworm
+FROM node:26-bookworm
 
-# node:24-bookworm 为完整版镜像；当前网页升级不直接驱动宿主 Docker，
+# node:26-bookworm 为完整版镜像；当前网页升级不直接驱动宿主 Docker，
 # 因此运行镜像不再内置 Docker CLI/Compose，也不挂载 docker.sock。
 
 ARG PNPM_VERSION=11.20.0
