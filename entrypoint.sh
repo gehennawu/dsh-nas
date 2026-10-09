@@ -57,7 +57,20 @@ if [ -n "${DSH_TRUSTED_HOSTS:-}" ]; then
 fi
 
 # DSH_COOKIE_MAX_AGE_DAYS → 生成 connection 行 overlay（--patch 只在根 profile 层之后追加，
-# 覆盖同名行的 config；必须重述 webRuntime.trustedHosts 表达式，否则该行会回落为空列表）。
+# 覆盖同名行的 config；必须重述 trustedHosts 表达式，否则该行会回落为空列表）。
+# 重述必须与 dsh 版本无关：trustedHosts 的来源服务在 alpha.1 是 webRuntime
+# （connection 行 inject: [webRuntime]），alpha.2 改为 webStartup
+# （inject: [webStartup]，且 dsh-web-app 不再提供 webRuntime）。overlay 只替换 config、
+# 不替换 inject，所以写死 ctx.<服务> 会在另一版本上抛 cordis 的
+# `cannot get property "<服务>" without inject`；connection 是 required 插件，
+# 该异常会让整个 dsh web 启动失败并进入容器 Restarting 循环。
+# ctx.get(name) 不经过 inject 校验、服务不存在时返回 undefined（不抛错），
+# 因此按可用性依次取值，两个版本以及后续版本都安全。
+# 老版本兼容实测：cordis 4.0.1–4.0.5-alpha.1 都有 ctx.get（缺失服务返回 undefined），
+# loader 1.0.2–1.0.6 的 !!js 求值一律是 `with (ctx) { return eval(expr) }`；
+# 0.1.0-rc.8…0.2.0 的 webRuntime.trustedHosts = [...lanAddresses, ...--trusted-host]，
+# 而 lanAddresses 只在绑定通配地址时非空（本 entrypoint 固定 --host 127.0.0.1），
+# 所以这些版本上 webStartup.trustedHosts 与旧表达式的取值完全相同。
 # 注意 argv 顺序：--patch 是 launcher flag，必须位于任何 app 参数（--host 等）之前——
 # launcher 以「第一个未识别 token」为界，之后的参数原样透传给 web app；
 # 把 --patch 放在 --host 之后会被 app 当作自己的参数并报 unknown option '--patch'。
@@ -77,7 +90,7 @@ if [ -n "${DSH_COOKIE_MAX_AGE_DAYS:-}" ]; then
     echo "# dsh-nas: browser-session cookie max age overlay（entrypoint.sh 生成，勿手改）"
     echo "- id: connection"
     echo "  config:"
-    echo "    trustedHosts: !!js ctx.webRuntime.trustedHosts"
+    echo "    trustedHosts: !!js (ctx.get('webStartup')?.trustedHosts ?? ctx.get('webRuntime')?.trustedHosts ?? [])"
     echo "    cookieMaxAgeDays: $DSH_COOKIE_MAX_AGE_DAYS"
   } > "$patch_file" || {
     echo "dsh-entrypoint: FATAL 无法写入 $patch_file" >&2
