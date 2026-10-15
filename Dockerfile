@@ -52,7 +52,8 @@ COPY --from=build /usr/local/lib/node_modules /usr/local/lib/node_modules
 
 # rc8+ 把 settings/credentials/directory-picker 等特权 RPC 固定为 loopback-only。
 # 运行容器以 node(1000) 启动，无权改 /usr/local/lib/node_modules；因此可选 patch
-# 必须在此处以构建用户 root 应用，并同时修改浏览器 bundle 与 Host API 栅栏。
+# 必须在此处以构建用户 root 应用，并同时修改 client bundle（alpha.3+ 拆分为
+# client.browser.js / client.node.js）与 Host API 栅栏（index.js）。
 COPY patch-trusted-domain.mjs /tmp/patch-trusted-domain.mjs
 RUN if [ -n "$DSH_TRUSTED_DOMAIN" ]; then \
       node /tmp/patch-trusted-domain.mjs "$DSH_TRUSTED_DOMAIN"; \

@@ -263,7 +263,7 @@ sudo ./deploy.sh update-script               # 升级本脚本（git 快进拉�
 - dsh 版本唯一来源为 `Dockerfile` 的 `ARG DSH_VERSION`。构建前从 npm registry 获取 `latest` 与 `next`/`alpha` 版本号，与锁定版一并列出供选择，选定后原子写回 Dockerfile。直连失败自动经代理重试；非交互或 registry 不可达时按锁定版继续，但 `--latest`/`--alpha` 获取 dist-tag 失败会直接报错退出，不回落至锁定版。`--skip-build` 不构建，故不询问。
 - 版本查询不使用 npm 本地缓存，直接经 HTTP 读取 registry，附带 `Cache-Control: no-cache` 与时间戳参数，避免中间层按 URL 缓存返回旧版本。
 - 首次构建需编译 native 依赖，耗时取决于 NAS CPU 与代理速度。构建上下文还须包含 `patch-trusted-domain.mjs`。
-- 构建完成后脚本实测镜像：校验两个 bundle 是否已接受反代域名、镜像内 dsh 版本是否与 Dockerfile 一致，不一致则拒绝启动；`--skip-build` 启动前执行同一套校验。patch 在构建的 RUN 步骤内执行，输出被 BuildKit 折叠，需逐行查看时使用 `BUILDKIT_PROGRESS=plain docker compose build dsh`。
+- 构建完成后脚本实测镜像：校验 dsh-client-connection 全部 bundle（alpha.3+ 为 client.browser.js / client.node.js / index.js）是否已接受反代域名、镜像内 dsh 版本是否与 Dockerfile 一致，不一致则拒绝启动；`--skip-build` 启动前执行同一套校验。patch 在构建的 RUN 步骤内执行，输出被 BuildKit 折叠，需逐行查看时使用 `BUILDKIT_PROGRESS=plain docker compose build dsh`。
 - `.dockerignore` 保证构建上下文不包含运行数据、密钥与部署脚本。构建阶段的 apt 与 npm 均经传入的代理；直连模式（`DSH_PROXY=` 空值）不注入代理参数。
 - 容器日志使用 json-file 驱动并限额（`max-size: 50m`、`max-file: 3`），避免长期运行占满磁盘。
 

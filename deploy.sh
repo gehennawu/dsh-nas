@@ -366,7 +366,7 @@ env_upsert() { # $1=key $2=value
 # ---------- DSH 反代域名 patch 选择 ----------
 # DSH_TRUSTED_DOMAIN 只保存 hostname，不含协议、端口或路径。
 # 空值表示保持原始 loopback-only 行为；非空值由 Compose 作为 Docker build arg
-# 传给 Dockerfile，在 root 构建阶段 patch 两个 dsh-client-connection bundle。
+# 传给 Dockerfile，在 root 构建阶段 patch dsh-client-connection 的 client bundle 与 Host API 栅栏。
 valid_trusted_domain() { # $1=hostname
   local domain="$1"
   [ -n "$domain" ] || return 0
@@ -960,13 +960,15 @@ cleanup_dangling_images() {
 # patch 在 Dockerfile 的 RUN 步骤内以 root 执行，BuildKit 的 TTY 进度 UI 会折叠 RUN 输出，
 # 部署过程因此看不到 patch 脚本自己的打印。这里在构建后直接进入镜像实测并把结论打印进
 # 部署日志（不依赖构建日志的展示方式）：
-#   1) 两个 dsh-client-connection bundle 的 patch 标记与反代域名是否真的写入；
+#   1) dsh-client-connection 各 bundle（alpha.3+ 为 client.browser.js / client.node.js /
+#      index.js；旧版为 client.js / index.js）的 patch 标记与反代域名是否真的写入；
 #   2) 镜像内安装的 dsh 版本是否与 Dockerfile 锁定一致（版本选择是否真正生效）；
 #   3) 真实入口脚本是否为 node 用户可读可执行（避免只用 --entrypoint node 绕过入口权限问题）。
 # 逐行查看 patch 脚本原始输出可运行: BUILDKIT_PROGRESS=plain docker compose build dsh
 verify_dsh_image() { # $1=阶段标签（如 "构建后" / "--skip-build "）
   local stage="$1" image="dsh:local" domain="${DSH_TRUSTED_DOMAIN:-}" probe
-  local dockerfile_v entrypoint_state image_v client_state index_state client_dom index_dom line rest
+  local dockerfile_v entrypoint_state image_v line rest
+  local browser_state browser_dom node_state node_dom legacy_state legacy_dom index_state index_dom
   dockerfile_v=$(sed -n 's/^ARG DSH_VERSION=//p' "$SCRIPT_DIR/Dockerfile" | head -n 1)
   if ! docker image inspect "$image" >/dev/null 2>&1; then
     fail "镜像 $image 不存在（${stage}核验）"
@@ -976,10 +978,24 @@ verify_dsh_image() { # $1=阶段标签（如 "构建后" / "--skip-build "）
     const fs = require("node:fs");
     const domain = process.argv[1] || "";
     const pkg = "/usr/local/lib/node_modules/@deepseek-ai/dsh/package.json";
-    const files = {
-      "client.js": "/usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-client-connection/lib/client.js",
-      "index.js": "/usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-client-connection/lib/index.js",
+    // alpha.3+ 把 client bundle 拆为 client.browser.js / client.node.js，更早版本是单一
+    // client.js；npm 也可能把 dsh-client-connection 提升到全局 node_modules 根。
+    // 候选顺序与 patch 脚本一致，按实际存在的 bundle 决定核验目标。
+    const bases = [
+      "/usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-client-connection/lib",
+      "/usr/local/lib/node_modules/@deepseek-ai/dsh-client-connection/lib",
+    ];
+    const findFile = (name) => {
+      for (const base of bases) {
+        try { fs.statSync(base + "/" + name); return base + "/" + name; } catch {}
+      }
+      return null;
     };
+    const names = findFile("client.browser.js")
+      ? ["client.browser.js", "client.node.js", "index.js"]
+      : findFile("client.js")
+        ? ["client.js", "index.js"]
+        : ["client.browser.js", "client.node.js", "index.js"];
     const marker = "dsh-nas: trusted-domain patch";
     const entrypoint = "/usr/local/bin/dsh-entrypoint";
     try {
@@ -990,9 +1006,11 @@ verify_dsh_image() { # $1=阶段标签（如 "构建后" / "--skip-build "）
       console.log("entrypoint=invalid," + (error.code || "access-failed"));
     }
     console.log("version=" + JSON.parse(fs.readFileSync(pkg, "utf8")).version);
-    for (const [name, file] of Object.entries(files)) {
+    for (const name of names) {
+      const file = findFile(name);
       let src;
       try {
+        if (!file) throw new Error("not-found");
         src = fs.readFileSync(file, "utf8");
       } catch {
         console.log(name + "=missing,no-file");
@@ -1006,15 +1024,21 @@ verify_dsh_image() { # $1=阶段标签（如 "构建后" / "--skip-build "）
     }
   ' "$domain" 2>/dev/null) || { fail "无法在镜像 $image 内执行核验（docker run 失败）"; return 1; }
 
-  entrypoint_state=""; image_v=""; client_state=""; index_state=""; client_dom=""; index_dom=""
+  entrypoint_state=""; image_v=""
+  browser_state=""; browser_dom=""; node_state=""; node_dom=""
+  legacy_state=""; legacy_dom=""; index_state=""; index_dom=""
   while IFS= read -r line; do
     case "$line" in
       entrypoint=*)
         entrypoint_state="${line#entrypoint=}" ;;
       version=*)
         image_v="${line#version=}" ;;
+      client.browser.js=*)
+        rest="${line#client.browser.js=}"; browser_state="${rest%%,*}"; browser_dom="${rest#*,}" ;;
+      client.node.js=*)
+        rest="${line#client.node.js=}"; node_state="${rest%%,*}"; node_dom="${rest#*,}" ;;
       client.js=*)
-        rest="${line#client.js=}"; client_state="${rest%%,*}"; client_dom="${rest#*,}" ;;
+        rest="${line#client.js=}"; legacy_state="${rest%%,*}"; legacy_dom="${rest#*,}" ;;
       index.js=*)
         rest="${line#index.js=}"; index_state="${rest%%,*}"; index_dom="${rest#*,}" ;;
     esac
@@ -1039,19 +1063,22 @@ verify_dsh_image() { # $1=阶段标签（如 "构建后" / "--skip-build "）
   fi
 
   if [ -n "$domain" ]; then
-    if [ "$client_state" = "patched" ] && [ "$index_state" = "patched" ] \
-       && [ "$client_dom" = "domain-ok" ] && [ "$index_dom" = "domain-ok" ]; then
-      ok "DSH patch 已生效（${stage}实测）: client.js + index.js 均接受反代域名 $domain"
+    if { [ "$browser_state" = "patched" ] && [ "$node_state" = "patched" ] && [ "$index_state" = "patched" ] \
+         && [ "$browser_dom" = "domain-ok" ] && [ "$node_dom" = "domain-ok" ] && [ "$index_dom" = "domain-ok" ]; } \
+       || { [ "$legacy_state" = "patched" ] && [ "$index_state" = "patched" ] \
+         && [ "$legacy_dom" = "domain-ok" ] && [ "$index_dom" = "domain-ok" ]; }; then
+      ok "DSH patch 已生效（${stage}实测）: dsh-client-connection 全部 bundle 接受反代域名 $domain"
       return 0
     fi
-    fail "DSH patch 核验未通过（${stage}实测，期望两个 bundle 均接受 $domain）: client.js=${client_state:-?}/${client_dom:-?} index.js=${index_state:-?}/${index_dom:-?}"
+    fail "DSH patch 核验未通过（${stage}实测，期望所有 bundle 均接受 $domain）: client.browser.js=${browser_state:-?}/${browser_dom:-?} client.node.js=${node_state:-?}/${node_dom:-?} client.js=${legacy_state:-?}/${legacy_dom:-?} index.js=${index_state:-?}/${index_dom:-?}"
     return 1
   else
-    if [ "$client_state" = "original" ] && [ "$index_state" = "original" ]; then
-      ok "DSH patch 未启用（${stage}实测）: client.js + index.js 保持原始 loopback-only 行为"
+    if { [ "$browser_state" = "original" ] && [ "$node_state" = "original" ] && [ "$index_state" = "original" ]; } \
+       || { [ "$legacy_state" = "original" ] && [ "$index_state" = "original" ]; }; then
+      ok "DSH patch 未启用（${stage}实测）: client bundle + index.js 保持原始 loopback-only 行为"
       return 0
     fi
-    fail "DSH patch 核验异常（${stage}实测，.env 未启用 patch 但镜像内发现 patch 标记）: client.js=${client_state:-?} index.js=${index_state:-?}"
+    fail "DSH patch 核验异常（${stage}实测，.env 未启用 patch 但镜像内发现 patch 标记）: client.browser.js=${browser_state:-?} client.node.js=${node_state:-?} client.js=${legacy_state:-?} index.js=${index_state:-?}"
     return 1
   fi
 }

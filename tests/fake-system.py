@@ -176,7 +176,8 @@ if args[:2] == ['run', '--rm']:
                        (project / 'Dockerfile').read_text().splitlines()
                        if line.startswith('ARG DSH_VERSION='))
         output(f'entrypoint=ok,mode=755,owner=0:0\nversion={version}\n'
-               'client.js=original,no-marker\nindex.js=original,no-marker')
+               'client.browser.js=original,no-marker\n'
+               'client.node.js=original,no-marker\nindex.js=original,no-marker')
     if 'validate' in args or '--entrypoint' in args and 'sh' in args:
         sys.exit(0)
     unexpected()

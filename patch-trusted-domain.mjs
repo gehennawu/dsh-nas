@@ -29,10 +29,38 @@ if (
   process.exit(2);
 }
 
-const files = [
-  '/usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-client-connection/lib/client.js',
-  '/usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-client-connection/lib/index.js',
+// alpha.3 把 client bundle 按运行平台拆分为 client.browser.js 与 client.node.js
+// （更早版本是单一 client.js）；npm 也可能把 dsh-client-connection 提升到全局
+// node_modules 根而非嵌套在 dsh 包内。这里按候选顺序解析出唯一同时包含全部
+// 目标文件的 lib 目录；找不到时整个构建失败，绝不留下只 patch 一半的镜像层。
+const libBases = [
+  '/usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-client-connection/lib',
+  '/usr/local/lib/node_modules/@deepseek-ai/dsh-client-connection/lib',
 ];
+const clientVariants = [
+  ['client.browser.js', 'client.node.js'], // alpha.3+：按平台拆分的 client bundle
+  ['client.js'], // alpha.2 及更早：单一共享 client bundle
+];
+const indexBundle = 'index.js'; // Host API 侧 loopback 栅栏
+let resolved;
+for (const base of libBases) {
+  for (const clientFiles of clientVariants) {
+    const names = [...clientFiles, indexBundle];
+    if (names.every((name) => fs.existsSync(`${base}/${name}`))) {
+      resolved = { base, files: names.map((name) => `${base}/${name}`) };
+      break;
+    }
+  }
+  if (resolved) break;
+}
+if (!resolved) {
+  throw new Error(
+    `DSH trusted-domain patch 未找到同时包含 client bundle（${clientVariants
+      .map((variant) => variant.join(' + '))
+      .join(' 或 ')}）与 ${indexBundle} 的目录，已搜索: ${libBases.join(' , ')}`,
+  );
+}
+const files = resolved.files;
 const marker = 'dsh-nas: trusted-domain patch';
 const declaration = /(function isLoopbackHostname\(hostname\)\s*\{)/g;
 const injected = ` if (hostname === ${JSON.stringify(domain)}) return true; // ${marker}`;
