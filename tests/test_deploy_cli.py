@@ -263,6 +263,31 @@ class DeployCliTests(unittest.TestCase):
         self.assertIn('ARG NODE_BASE_IMAGE=node:26-bookworm', (self.project / 'Dockerfile').read_text())
         self.assertEqual((self.project / 'Dockerfile').read_text().count('FROM ${NODE_BASE_IMAGE}'), 2)
 
+    def test_pull_timeout_auto_continues_when_completed_without_selection(self):
+        self.env['TEST_PULL_RESULT'] = 'timeout_then_auto_success'
+        result = self.run_deploy_with_tty('1\n')
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn('基础镜像已在后台下载完成，自动继续构建', result.stdout)
+        calls = (self.root / 'base-image-calls').read_text()
+        self.assertIn('pull node:26-bookworm', calls)
+        self.assertIn('NODE_BASE_IMAGE=node:26-bookworm', calls)
+
+    def test_pull_timeout_continue_waiting_then_success(self):
+        self.env['TEST_PULL_RESULT'] = 'timeout_then_success'
+        result = self.run_deploy_with_tty('1\n1\n')
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn('继续等待当前基础镜像下载', result.stdout)
+        calls = (self.root / 'base-image-calls').read_text()
+        self.assertIn('pull node:26-bookworm', calls)
+        self.assertIn('NODE_BASE_IMAGE=node:26-bookworm', calls)
+
+    def test_pull_timeout_quit_aborts_build(self):
+        self.env['TEST_PULL_RESULT'] = 'timeout'
+        result = self.run_deploy_with_tty('1\n3\n')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('用户选择退出构建', result.stdout)
+        self.assertNotIn('NODE_BASE_IMAGE=', (self.root / 'base-image-calls').read_text())
+
     def test_final_dsh_image_declares_cleanup_ownership(self):
         final_stage = (self.project / 'Dockerfile').read_text().rsplit('FROM ', 1)[1]
         self.assertIn('LABEL io.github.gehennawu.dsh-nas.cleanup="dsh"', final_stage)

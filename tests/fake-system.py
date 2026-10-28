@@ -71,6 +71,15 @@ if name == 'chown':
     sys.exit(0)
 
 if name in ('sync', 'sleep'):
+    if name == 'sleep' and os.environ.get('TEST_PULL_RESULT') == 'timeout_then_success':
+        marker = root / 'sleep-first-called'
+        if not marker.exists():
+            marker.touch()
+            sys.exit(0)
+        else:
+            import time
+            time.sleep(2)
+            sys.exit(0)
     sys.exit(0)
 
 if name == 'ss' and args == ['-ltn']:
@@ -86,9 +95,23 @@ if name != 'docker':
 
 if args[:1] == ['pull'] and len(args) == 2:
     with (root / 'base-image-calls').open('a') as log:
-        log.write('pull ' + args[1] + '\n')
-    return_code = 1 if args[1] == 'node:26-bookworm' and os.environ.get('TEST_PULL_RESULT') == 'failure' else 0
-    sys.exit(return_code)
+        if args[1] == 'node:26-bookworm' and os.environ.get('TEST_PULL_RESULT') in ('timeout', 'timeout_then_success', 'timeout_then_auto_success'):
+            log.write('pull ' + args[1] + ' (timeout)\n')
+        else:
+            log.write('pull ' + args[1] + '\n')
+    if args[1] == 'node:26-bookworm' and os.environ.get('TEST_PULL_RESULT') == 'failure':
+        sys.exit(1)
+    if args[1] == 'node:26-bookworm' and os.environ.get('TEST_PULL_RESULT') == 'timeout':
+        import signal
+        try:
+            signal.pause()
+        except KeyboardInterrupt:
+            sys.exit(130)
+    if args[1] == 'node:26-bookworm' and os.environ.get('TEST_PULL_RESULT') in ('timeout_then_success', 'timeout_then_auto_success'):
+        import time
+        time.sleep(0.05)
+        sys.exit(0)
+    sys.exit(0)
 if args[:2] == ['compose', 'build']:
     build_args = args[2:]
     if '--build-arg' not in build_args:
