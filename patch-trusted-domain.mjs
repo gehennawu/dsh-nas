@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import fs from 'node:fs';
+import { spawnSync } from 'node:child_process';
 
 const rawDomain = process.argv[2];
 const trimmedDomain = rawDomain?.trim();
@@ -63,7 +64,8 @@ if (!resolved) {
 const files = resolved.files;
 const marker = 'dsh-nas: trusted-domain patch';
 const declaration = /(function isLoopbackHostname\(hostname\)\s*\{)/g;
-const injected = ` if (hostname === ${JSON.stringify(domain)}) return true; // ${marker}`;
+// 压缩 bundle 可能整份只有一行：行注释会吞掉余下代码，必须用块注释并补换行。
+const injected = ` if (hostname === ${JSON.stringify(domain)}) return true; /* ${marker} */\n`;
 const prepared = [];
 
 // 先把所有目标读取并校验完，再写入；升级导致任一 bundle 结构变化时整个构建失败，
@@ -85,7 +87,20 @@ for (const file of files) {
     );
   }
 
-  prepared.push({ file, patched: source.replace(declaration, `$1${injected}`) });
+  const patched = source.replace(declaration, `$1${injected}`);
+  // 从 stdin 解析 ESM，不执行 bundle、不加载依赖，也不先覆盖原文件。
+  // 所有目标都通过语法硬校验后才允许写入；非零退出或解析器启动失败均终止构建。
+  const checked = spawnSync(process.execPath, ['--input-type=module', '--check'], {
+    input: patched,
+    encoding: 'utf8',
+  });
+  if (checked.error || checked.status !== 0) {
+    throw new Error(
+      `DSH trusted-domain patch 语法校验失败: ${file}\n${checked.error?.message ?? checked.stderr}`,
+    );
+  }
+
+  prepared.push({ file, patched });
 }
 
 for (const { file, patched } of prepared) {

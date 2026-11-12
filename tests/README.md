@@ -8,7 +8,7 @@
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
 ```
 
-Python 仅用于开发测试，不是生产部署的新依赖。
+Python 仅用于开发测试，不是生产部署的新依赖。trusted-domain 补丁测试还需要 Node.js；缺少 Node.js 时会明确跳过。
 
 ## 测试边界与隔离方式
 
@@ -35,6 +35,9 @@ Python 仅用于开发测试，不是生产部署的新依赖。
   inject 变化会让 required 插件 connection 启动失败），`--patch` 位于 app 参数之前，
   探测失败不加 `--patch`，未配置天数和非法天数两种路径。
 - 非 TTY 纯文本输出；PTY 下的颜色、`NO_COLOR` 和 `TERM=dumb` 行为；token 链接仍按原方式展示。环境无法分配 PTY 时该项明确跳过，需在可用终端上补测。
+- `patch-trusted-domain.mjs`：在隔离临时目录中仅重定位安装路径，执行真实补丁 CLI；覆盖单行压缩与多行 bundle、新旧文件布局及 hoisted 路径，验证 patch 前后语法、注册尾部执行、可信域名放行与原 loopback 行为；语法错误、重复 patch、缺少声明和非法域名必须失败，且不部分写入目标。
+
+- 镜像静态探针：提取 `deploy.sh` 的真实嵌入 JS，在隔离目录运行；覆盖新旧完整布局、hoisted 回退、跨目录拼接拒绝、未启用 patch 仍检查语法、旧行注释与错位/重复标记和错误域名拒绝。不启动 Docker 或 DSH。
 
 ## 未覆盖的真实环境验收
 

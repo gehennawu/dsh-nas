@@ -976,7 +976,7 @@ verify_dsh_image() { # $1=阶段标签（如 "构建后" / "--skip-build "）
   fi
   probe=$(docker run --rm --entrypoint node "$image" -e '
     const fs = require("node:fs");
-    const domain = process.argv[1] || "";
+    const domain = (process.argv[1] || "").toLowerCase();
     const pkg = "/usr/local/lib/node_modules/@deepseek-ai/dsh/package.json";
     // alpha.3+ 把 client bundle 拆为 client.browser.js / client.node.js，更早版本是单一
     // client.js；npm 也可能把 dsh-client-connection 提升到全局 node_modules 根。
@@ -985,18 +985,25 @@ verify_dsh_image() { # $1=阶段标签（如 "构建后" / "--skip-build "）
       "/usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-client-connection/lib",
       "/usr/local/lib/node_modules/@deepseek-ai/dsh-client-connection/lib",
     ];
-    const findFile = (name) => {
-      for (const base of bases) {
-        try { fs.statSync(base + "/" + name); return base + "/" + name; } catch {}
+    const variants = [["client.browser.js", "client.node.js"], ["client.js"]];
+    let resolved;
+    for (const base of bases) {
+      for (const clients of variants) {
+        const names = [...clients, "index.js"];
+        if (names.every(name => fs.existsSync(base + "/" + name))) {
+          resolved = { base, names };
+          break;
+        }
       }
-      return null;
-    };
-    const names = findFile("client.browser.js")
-      ? ["client.browser.js", "client.node.js", "index.js"]
-      : findFile("client.js")
-        ? ["client.js", "index.js"]
-        : ["client.browser.js", "client.node.js", "index.js"];
+      if (resolved) break;
+    }
+    if (!resolved) throw new Error("未找到同目录的完整 connection bundle，拒绝跨目录拼接");
+    const { base, names } = resolved;
+    console.log("bundle-base=" + base);
+    const { spawnSync } = require("node:child_process");
     const marker = "dsh-nas: trusted-domain patch";
+    const declaration = /function isLoopbackHostname\(hostname\)\s*\{/g;
+    const injected = ` if (hostname === ${JSON.stringify(domain)}) return true; /* ${marker} */\n`;
     const entrypoint = "/usr/local/bin/dsh-entrypoint";
     try {
       const st = fs.statSync(entrypoint);
@@ -1007,22 +1014,36 @@ verify_dsh_image() { # $1=阶段标签（如 "构建后" / "--skip-build "）
     }
     console.log("version=" + JSON.parse(fs.readFileSync(pkg, "utf8")).version);
     for (const name of names) {
-      const file = findFile(name);
+      const file = base + "/" + name;
       let src;
       try {
-        if (!file) throw new Error("not-found");
         src = fs.readFileSync(file, "utf8");
       } catch {
         console.log(name + "=missing,no-file");
         continue;
       }
-      if (!src.includes(marker)) {
+      // 只解析、不执行 bundle；--skip-build 和未启用 patch 的镜像也必须通过。
+      const checked = spawnSync(process.execPath, ["--input-type=module", "--check"], {
+        input: src, encoding: "utf8",
+      });
+      if (checked.error || checked.status !== 0) {
+        throw new Error(`bundle 语法校验失败: ${file}\n${checked.error?.message ?? checked.stderr}`);
+      }
+      const declarations = [...src.matchAll(declaration)];
+      const markers = src.split(marker).length - 1;
+      if (!domain) {
+        if (markers) throw new Error(`未启用 patch 但发现补丁标记: ${file}`);
         console.log(name + "=original,no-marker");
       } else {
-        console.log(name + "=patched," + (src.includes(JSON.stringify(domain)) ? "domain-ok" : "domain-missing"));
+        const match = declarations[0];
+        if (declarations.length !== 1 || markers !== 1 ||
+            src.slice(match.index + match[0].length, match.index + match[0].length + injected.length) !== injected) {
+          throw new Error(`补丁结构校验失败（旧注释、域名不匹配或非预期注入），请重新构建: ${file}`);
+        }
+        console.log(name + "=patched,domain-ok");
       }
     }
-  ' "$domain" 2>/dev/null) || { fail "无法在镜像 $image 内执行核验（docker run 失败）"; return 1; }
+  ' "$domain") || { fail "镜像 $image 静态核验失败（详见上方错误），拒绝启动；请重新构建"; return 1; }
 
   entrypoint_state=""; image_v=""
   browser_state=""; browser_dom=""; node_state=""; node_dom=""
@@ -1067,7 +1088,7 @@ verify_dsh_image() { # $1=阶段标签（如 "构建后" / "--skip-build "）
          && [ "$browser_dom" = "domain-ok" ] && [ "$node_dom" = "domain-ok" ] && [ "$index_dom" = "domain-ok" ]; } \
        || { [ "$legacy_state" = "patched" ] && [ "$index_state" = "patched" ] \
          && [ "$legacy_dom" = "domain-ok" ] && [ "$index_dom" = "domain-ok" ]; }; then
-      ok "DSH patch 已生效（${stage}实测）: dsh-client-connection 全部 bundle 接受反代域名 $domain"
+      ok "DSH patch 结构与语法检查通过（${stage}静态核验）: 全部 connection bundle 注入域名 $domain"
       return 0
     fi
     fail "DSH patch 核验未通过（${stage}实测，期望所有 bundle 均接受 $domain）: client.browser.js=${browser_state:-?}/${browser_dom:-?} client.node.js=${node_state:-?}/${node_dom:-?} client.js=${legacy_state:-?}/${legacy_dom:-?} index.js=${index_state:-?}/${index_dom:-?}"
