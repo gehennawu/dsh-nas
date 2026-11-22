@@ -26,11 +26,17 @@ ARG DSH_VERSION=0.1.0-rc.8
 # apt 与 npm 都使用构建时注入的 HTTP_PROXY/HTTPS_PROXY（--build-arg）。
 # 注意 NAS 上构建容器内的 127.0.0.1 是容器自身，不是宿主——代理地址须为宿主可达，
 # 由 deploy.sh 配置向导输入的代理地址提供（如 http://192.168.1.10:7890）。
+#
+# `dsh --version` 是版本一致性自检：npm 安装成功不等于 CLI 可启动，上游曾发布过
+# 依赖未发布 cordis-plugin-loader 导出的 alpha（dsh-app-boot 顶层 import 在模块
+# 链接阶段即抛 SyntaxError，任何 dsh 子命令都起不来）。构建期早失败，避免构建十分钟
+# 后在容器 Restarting 循环里才看到症状。
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       python3 make g++ ca-certificates \
  && rm -rf /var/lib/apt/lists/* \
- && npm install -g @deepseek-ai/dsh@${DSH_VERSION}
+ && npm install -g @deepseek-ai/dsh@${DSH_VERSION} \
+ && dsh --version
 
 # ---------- 运行阶段：干净的运行时镜像 ----------
 FROM ${NODE_BASE_IMAGE}

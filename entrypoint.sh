@@ -12,7 +12,8 @@
 #    Host 头绕过信任栅栏，不需要；仅在直连 3080 或透传真实 Host 时才需要）。
 # 4) 可选：DSH_COOKIE_MAX_AGE_DAYS 为 dsh Web 浏览器会话 cookie 有效期（正整数天数；
 #    空值用 dsh 默认 30）。v0.1.2+ 一次性 token 认证签发该 cookie；这里按配置生成
-#    --patch overlay 覆盖 connection 行，无需修改镜像。
+#    --patch overlay 覆盖 cookie 有效期所属行（旧版 connection；0.2.3+ authentication-token），
+#    无需修改镜像。
 # 5) rc8+ 的反向代理 trusted-domain 兼容 patch 在 Dockerfile 构建阶段应用；
 #    运行容器保持 node(1000)，不修改 /usr/local/lib/node_modules。
 set -e
@@ -86,23 +87,43 @@ if [ -n "${DSH_COOKIE_MAX_AGE_DAYS:-}" ]; then
     exit 1
   fi
   patch_file="$DSH_HOME/web-cookie-max-age.yml"
-  {
-    echo "# dsh-nas: browser-session cookie max age overlay（entrypoint.sh 生成，勿手改）"
-    echo "- id: connection"
-    echo "  config:"
-    echo "    trustedHosts: !!js (ctx.get('webStartup')?.trustedHosts ?? ctx.get('webRuntime')?.trustedHosts ?? [])"
-    echo "    cookieMaxAgeDays: $DSH_COOKIE_MAX_AGE_DAYS"
-  } > "$patch_file" || {
-    echo "dsh-entrypoint: FATAL 无法写入 $patch_file" >&2
-    exit 1
+  # cookie 有效期的归属行随版本漂移：0.2.2-rc.5 及更早在 connection 行
+  # （其 Config 含 cookieMaxAgeDays）；0.2.3-alpha.1 起该键移入
+  # @deepseek-ai/dsh-host-authentication-token 的 authentication-token 行，
+  # connection 行的 Config 只剩 recovery/trustedHosts/maxRequestBodyBytes。
+  # 先按旧布局写入，探测到 authentication-token 行后再改写，两个布局共用同一份环境变量；
+  # 点名未知行只会让 loader 告警并继续启动，但这里仍按实际布局重建，避免依赖该行为。
+  write_overlay() { # $1=connection（旧布局）| auth-token（0.2.3+ 布局）
+    {
+      echo "# dsh-nas: browser-session cookie max age overlay（entrypoint.sh 生成，勿手改）"
+      echo "- id: connection"
+      echo "  config:"
+      echo "    trustedHosts: !!js (ctx.get('webStartup')?.trustedHosts ?? ctx.get('webRuntime')?.trustedHosts ?? [])"
+      if [ "$1" = "connection" ]; then
+        echo "    cookieMaxAgeDays: $DSH_COOKIE_MAX_AGE_DAYS"
+      fi
+      if [ "$1" = "auth-token" ]; then
+        echo "- id: authentication-token"
+        echo "  config:"
+        echo "    cookieMaxAgeDays: $DSH_COOKIE_MAX_AGE_DAYS"
+      fi
+    } > "$patch_file" || {
+      echo "dsh-entrypoint: FATAL 无法写入 $patch_file" >&2
+      exit 1
+    }
   }
+  write_overlay connection
   # 老版本 dsh 的 launcher 不认识 --patch（启动时报 unknown option 并退出，
   # 导致容器 Restarting 崩溃循环）。用零副作用探测确认支持后再追加参数：
   # `dsh web --dump-config --patch <file>` 只走 dump-config 分支、不 boot 应用、
   # 不求值 !!js；支持 --patch 的版本正常 exit 0，老版本在 app 参数解析阶段报错非 0。
+  # 探测输出同时用于识别 cookie 归属行，不额外启动一次 dsh。
   patch_args=""
-  if dsh web --dump-config --patch "$patch_file" >/dev/null 2>&1; then
+  if patch_dump=$(dsh web --dump-config --patch "$patch_file" 2>/dev/null); then
     patch_args="--patch $patch_file"
+    if printf '%s\n' "$patch_dump" | grep -q '^- id: authentication-token$'; then
+      write_overlay auth-token
+    fi
   else
     echo "dsh-entrypoint: WARN 当前 dsh 版本不支持 --patch overlay，DSH_COOKIE_MAX_AGE_DAYS 不生效；" >&2
     echo "dsh-entrypoint: WARN 升级 dsh（如 --alpha）到支持 --patch 的版本后会自动启用。" >&2

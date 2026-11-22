@@ -19,10 +19,15 @@ REPO = Path(__file__).resolve().parents[1]
 
 STUB_DSH = """#!/bin/sh
 line=""
+dump=0
 for arg in "$@"; do
   line="$line|$arg"
+  if [ "$arg" = "--dump-config" ]; then dump=1; fi
 done
 printf '%s\\n' "$line" >> "$FAKE_DSH_LOG"
+if [ "$dump" = 1 ] && [ "${FAKE_DSH_LAYOUT:-legacy}" = "modern" ]; then
+  printf -- '- id: connection\\n- id: authentication-token\\n'
+fi
 exit 0
 """
 
@@ -34,7 +39,7 @@ class EntrypointOverlayTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.bin = self.root / 'bin'
         self.bin.mkdir()
-        for tool in ('sh', 'mkdir', 'id'):
+        for tool in ('sh', 'mkdir', 'id', 'grep'):
             executable = shutil.which(tool)
             if not executable:
                 self.skipTest(f'Required test tool unavailable: {tool}')
@@ -52,12 +57,14 @@ class EntrypointOverlayTests(unittest.TestCase):
             'DSH_HOME': str(self.home), 'FAKE_DSH_LOG': str(self.log),
         }
 
-    def run_entrypoint(self, *args, cookie='365'):
+    def run_entrypoint(self, *args, cookie='365', layout=None):
         env = dict(self.env)
         if cookie is None:
             env.pop('DSH_COOKIE_MAX_AGE_DAYS', None)
         else:
             env['DSH_COOKIE_MAX_AGE_DAYS'] = cookie
+        if layout is not None:
+            env['FAKE_DSH_LAYOUT'] = layout
         return subprocess.run(['sh', str(self.script), *args], env=env,
                               capture_output=True, text=True, timeout=30)
 
@@ -114,6 +121,34 @@ class EntrypointOverlayTests(unittest.TestCase):
                                 capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout), [[], ['newer'], ['legacy']])
+
+    def test_cookie_row_follows_the_version_that_owns_the_option(self):
+        """0.2.3-alpha.1 moved cookieMaxAgeDays off the connection row.
+
+        The new connection Config keeps only recovery/trustedHosts/maxRequestBodyBytes;
+        the browser-session lifetime now belongs to @deepseek-ai/dsh-host-authentication-token
+        (row `authentication-token`). An overlay that writes the old row is silently
+        dropped by schema validation, so the setting must follow the owning row.
+        """
+        proc = self.run_entrypoint('--port', '3999', layout='modern')
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        overlay = (self.home / 'web-cookie-max-age.yml').read_text()
+        rows = overlay.split('\n- id: ')
+        connection = next(row for row in rows if row.startswith('connection'))
+        auth = next(row for row in rows if row.startswith('authentication-token'))
+        self.assertNotIn('cookieMaxAgeDays', connection)
+        self.assertIn('cookieMaxAgeDays: 365', auth)
+        # trustedHosts 仍须重述，否则 connection 行回落到空列表。
+        self.assertIn("'webStartup'", connection)
+
+    def test_legacy_layout_still_writes_cookie_to_connection(self):
+        proc = self.run_entrypoint('--port', '3999')
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        overlay = (self.home / 'web-cookie-max-age.yml').read_text()
+        self.assertNotIn('- id: authentication-token', overlay)
+        rows = overlay.split('\n- id: ')
+        connection = next(row for row in rows if row.startswith('connection'))
+        self.assertIn('cookieMaxAgeDays: 365', connection)
 
     def test_launcher_flag_precedes_app_args_and_probe_gates_it(self):
         proc = self.run_entrypoint('--port', '3999')
