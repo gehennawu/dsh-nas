@@ -59,6 +59,10 @@ docker compose up -d dsh          # 重建容器生效，不用重新构建镜�
 
 **alpha 预览版已经发布到 npm 的 `alpha` dist-tag。** 当前不要用 `--latest` 期待得到 alpha 版本：`--latest` 只读取 npm `latest` 正式版。升级前请先备份 `data/dsh/`，并确认目标 alpha 版本的会话/插件兼容性。
 
+> **0.2.3-alpha.1 是坏包，alpha.2 已修复（2026-11-22 实测）**：alpha.1 安装后 `dsh` 的任何子命令都无法启动，`@deepseek-ai/dsh-app-boot` 在模块链接阶段抛
+> `SyntaxError: The requested module '@deepseek-ai/cordis-plugin-loader' does not provide an export named 'EntryValidationError'`。
+> alpha.2 补发了 `@deepseek-ai/cordis-plugin-loader@1.2.0-alpha.1`（含缺失的 `EntryValidationError`、`formatIssues`、`relocate`、`validateOptions`）并把它写进 dsh 依赖，`dsh --version` 与 `dsh web` 均正常。与本仓库的 trusted-domain patch 无关——patch 在 alpha.2 的三个 connection bundle 上仍正常应用，实测公网域名走 Host 栅栏返回 401（通过）、其他域名 403。alpha.2 另要求 Node `^24.22.3 || >=26.13.1`，构建前会重新拉取 `node:26-bookworm`，无需改 Dockerfile。
+
 ```sh
 # 老用户完整命令（保护配置/自升级在阶段 0；脚本旧则先手动 git pull 一次）
 cd /path/to/dsh-nas && sudo ./deploy.sh update-script
@@ -130,6 +134,8 @@ sudo ./deploy.sh --cookie-max-age 120            # 直接设置
 留空 = dsh 默认 30 天。cookie 是 bearer 凭证，有效期越长被盗后的暴露窗口越大，建议够用即可。
 
 **注意：改时长只对新签发的 cookie 生效。** 已持有的 cookie 保持原到期时间不变——改完配置后，每个浏览器需重新打开一次 token URL（重新交换）才能拿到新时长。
+
+有效期所属的配置行随 dsh 版本漂移：0.2.2-rc.5 及更早在 `connection` 行，0.2.3-alpha.1 起移到 `authentication-token` 行（`connection` 的 schema 不再接受该键）。entrypoint 用 `dsh web --dump-config` 的输出识别实际布局，把 `cookieMaxAgeDays` 写到拥有该键的行，升级或回滚都不需要手改 overlay。
 
 ### 日常升级（与以前相同）
 
